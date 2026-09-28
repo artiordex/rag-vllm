@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ragvllm
+      POSTGRES_USER: ragvllm
+      POSTGRES_PASSWORD: ragvllm-dev-only
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - ragvllm-postgres:/var/lib/postgresql/data
+
+  vllm:
+    profiles: ["vllm"]
+    image: "${VLLM_IMAGE:-vllm/vllm-openai:latest}"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${VLLM_HOST_PORT:-8001}:8000"
+    environment:
+      HF_TOKEN: "${HF_TOKEN:-}"
+    volumes:
+      - ragvllm-huggingface-cache:/root/.cache/huggingface
+      - ragvllm-compile-cache:/root/.cache/vllm
+    ipc: host
+    gpus: all
+    command:
+      - "${VLLM_MODEL:-Qwen/Qwen3-0.6B}"
+      - "--served-model-name"
+      - "${VLLM_SERVED_MODEL_NAME:-rag-vllm-model}"
+      - "--max-model-len"
+      - "${VLLM_MAX_MODEL_LEN:-8192}"
+      - "--api-key"
+      - "${VLLM_API_KEY:-vllm-local}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+
+volumes:
+  ragvllm-postgres:
+  ragvllm-huggingface-cache:
+  ragvllm-compile-cache:

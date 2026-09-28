@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "[rag-vllm] uv sync",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "sync"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "[rag-vllm] run",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "run",
+        "rag-vllm"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "dependsOn": [
+        "[rag-vllm] uv sync"
+      ],
+      "dependsOrder": "sequence",
+      "group": "build"
+    }
+  ]
+}
