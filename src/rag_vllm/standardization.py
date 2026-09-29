@@ -93,7 +93,7 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
 
 
 # =====================================================================
-# 2. Administrative Terminology Standardization (행정표준용어 매핑)
+# 2. Local example synonyms (official dictionary matching is not implemented here)
 # =====================================================================
 
 ADMINISTRATIVE_SYNONYMS = {
@@ -136,7 +136,7 @@ def standardize_administrative_terms(text: str) -> tuple[str, dict[str, int]]:
 
 
 # =====================================================================
-# 3. 5-Pillar Enterprise Data Quality Evaluation (공공데이터 실태평가 5대 지표)
+# 3. Internal illustrative quality buckets (not an official DQC score)
 # =====================================================================
 
 def evaluate_enterprise_quality(

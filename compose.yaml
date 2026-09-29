@@ -32,7 +32,7 @@ services:
       - "--max-model-len"
       - "${VLLM_MAX_MODEL_LEN:-8192}"
       - "--gpu-memory-utilization"
-      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.75}"
       - "--api-key"
       - "${VLLM_API_KEY:-vllm-local}"
       - "--host"

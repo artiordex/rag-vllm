@@ -33,7 +33,12 @@ class QualityReport(BaseModel):
     pii_detected_count: int = 0
     pii_details: list[dict[str, Any]] = Field(default_factory=list)
     standardized_terms_count: int = 0
-    standardized_terms: dict[str, str] = Field(default_factory=dict)
+    standardized_terms: dict[str, int] = Field(default_factory=dict)
+    standardization_status: str | None = None
+    standardization_source: str | None = None
+    standardization_applied: bool | None = None
+    pii_scan_scope: str | None = None
+    pii_masking_applied: bool | None = None
     recommendations: list[str] = Field(default_factory=list)
 
 
@@ -111,6 +116,7 @@ class EnterpriseQualityRequest(BaseModel):
     text: str | None = None
     document_id: UUID | None = None
     auto_mask_pii: bool = True
+    apply_local_term_replacements: bool = False
 
 
 class EnterpriseQualityResponse(BaseModel):
@@ -122,6 +128,11 @@ class EnterpriseQualityResponse(BaseModel):
     pii_details: list[dict[str, Any]] = Field(default_factory=list)
     standardized_terms_count: int
     standardized_terms: dict[str, int] = Field(default_factory=dict)
+    standardization_status: str = "local_candidates_pending_review"
+    standardization_source: str = "rag-vllm_builtin_synonyms"
+    standardization_applied: bool = False
+    pii_scan_scope: str = "heuristic_pattern_match"
+    pii_masking_applied: bool = False
     recommendations: list[str] = Field(default_factory=list)
 
 

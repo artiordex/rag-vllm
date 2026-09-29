@@ -46,16 +46,26 @@ def ingest_text(
     mime_type: str | None,
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    # 1. PII detection and auto-masking & Terminology standardization
-    masked_text, _ = detect_and_mask_pii(text, mask=True)
-    std_text, _ = standardize_administrative_terms(masked_text)
+    # The input is not archived as a separate object. The database stores the
+    # normalized text; with PII masking disabled that text can still be unmasked.
+    if settings.ingest_auto_mask_pii:
+        processed_text, pii_candidates = detect_and_mask_pii(text, mask=True)
+    else:
+        processed_text, pii_candidates = text, detect_and_mask_pii(text, mask=False)[1]
+    suggested_text, term_candidates = standardize_administrative_terms(processed_text)
+    std_text = suggested_text if settings.ingest_apply_local_term_replacements else processed_text
     normalized = normalize_text(std_text)
     if not normalized:
         raise ValueError("추출된 텍스트가 비어 있습니다.")
 
     content_hash = _content_hash(normalized)
     existing = find_document_by_hash(settings, name, content_hash)
-    quality = evaluate_enterprise_quality(text, name, auto_mask_pii=True)
+    quality = evaluate_enterprise_quality(
+        text,
+        name,
+        auto_mask_pii=settings.ingest_auto_mask_pii,
+        apply_local_term_replacements=settings.ingest_apply_local_term_replacements,
+    )
     if existing:
         return {
             "document_id": existing["id"],
@@ -78,6 +88,25 @@ def ingest_text(
         for chunk in text_chunks
     ]
     embeddings = get_embedder(settings).embed_documents([chunk["text"] for chunk in chunks])
+    processing_metadata = {
+        "pipeline_version": "rag-vllm-ingestion-v2",
+        "input_content_retained_separately": False,
+        "stored_content_is_derived": True,
+        "stored_content_masked": settings.ingest_auto_mask_pii,
+        "content_transformations": [
+            "NFKC_and_whitespace_normalization",
+            *(["heuristic_pii_masking"] if settings.ingest_auto_mask_pii else []),
+            *(["local_term_replacements"] if settings.ingest_apply_local_term_replacements else []),
+        ],
+        "pii_detection": "heuristic_pattern_match",
+        "pii_candidates_detected": len(pii_candidates),
+        "pii_masking_applied": settings.ingest_auto_mask_pii,
+        "term_candidates_detected": term_candidates,
+        "local_term_replacements_applied": settings.ingest_apply_local_term_replacements,
+        "standardization_status": "local_candidates_pending_review",
+        "official_standardization_verified": False,
+    }
+    persisted_metadata = {**metadata, "rag_vllm_processing": processing_metadata}
     document_id, duplicate, chunk_count = save_document(
         settings,
         source_name=name,
@@ -85,7 +114,7 @@ def ingest_text(
         mime_type=mime_type,
         content_hash=content_hash,
         content=normalized,
-        metadata=metadata,
+        metadata=persisted_metadata,
         quality_report=quality,
         chunks=chunks,
         embeddings=embeddings,
@@ -466,6 +495,7 @@ def enterprise_quality_service(
     text: str | None = None,
     document_id: UUID | None = None,
     auto_mask_pii: bool = True,
+    apply_local_term_replacements: bool = False,
 ) -> dict[str, Any]:
     """Perform comprehensive 5-pillar data quality & PII evaluation."""
     target_text = ""
@@ -485,7 +515,12 @@ def enterprise_quality_service(
     else:
         raise ValueError("text 또는 document_id 중 하나는 필요합니다.")
 
-    return evaluate_enterprise_quality(target_text, source_name=source_name, auto_mask_pii=auto_mask_pii)
+    return evaluate_enterprise_quality(
+        target_text,
+        source_name=source_name,
+        auto_mask_pii=auto_mask_pii,
+        apply_local_term_replacements=apply_local_term_replacements,
+    )
 
 
 def structured_quality_service(
@@ -501,5 +536,3 @@ def structured_quality_service(
 def get_recent_audit_logs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
     """Retrieve audit logs for compliance tracking."""
     return get_audit_logs(settings, limit=limit)
-
-

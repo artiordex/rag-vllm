@@ -59,6 +59,8 @@ class Settings:
     llm_model: str | None
     llm_timeout_seconds: float
     max_upload_bytes: int
+    ingest_auto_mask_pii: bool
+    ingest_apply_local_term_replacements: bool
     api_key: str | None
     auto_init_db: bool
 
@@ -84,6 +86,8 @@ class Settings:
             llm_model=os.getenv("LLM_MODEL") or None,
             llm_timeout_seconds=_float_env("LLM_TIMEOUT_SECONDS", 60.0),
             max_upload_bytes=_int_env("MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
+            ingest_auto_mask_pii=_bool_env("INGEST_AUTO_MASK_PII", True),
+            ingest_apply_local_term_replacements=_bool_env("INGEST_APPLY_LOCAL_TERM_REPLACEMENTS", False),
             api_key=os.getenv("RAG_LAB_API_KEY") or None,
             auto_init_db=_bool_env("AUTO_INIT_DB", True),
         )

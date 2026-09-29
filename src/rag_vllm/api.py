@@ -63,6 +63,8 @@ def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-K
 
 
 def _service_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
     if isinstance(exc, ParseError):
         return HTTPException(status_code=415, detail=str(exc))
     if isinstance(exc, ValueError):
@@ -178,15 +180,16 @@ async def ingest_file_endpoint(
     file: UploadFile = File(...),
     metadata: str = Form(default="{}"),
 ) -> IngestResponse:
-    payload = await file.read()
-    if len(payload) > settings.max_upload_bytes:
-        raise HTTPException(status_code=413, detail=f"파일은 {settings.max_upload_bytes}바이트 이하만 허용됩니다.")
     try:
+        payload = await file.read(settings.max_upload_bytes + 1)
+        if len(payload) > settings.max_upload_bytes:
+            raise HTTPException(status_code=413, detail=f"파일은 {settings.max_upload_bytes}바이트 이하만 허용됩니다.")
         parsed_metadata = json.loads(metadata)
         if not isinstance(parsed_metadata, dict):
             raise ValueError("metadata는 JSON object여야 합니다.")
         parsed = parse_document(file.filename or "uploaded-file", payload, file.content_type)
-        merged_metadata = {**parsed.metadata, **parsed_metadata}
+        # Parser evidence wins over caller-supplied values with the same key.
+        merged_metadata = {**parsed_metadata, **parsed.metadata}
         return ingest_text(
             settings,
             name=file.filename or "uploaded-file",
@@ -195,8 +198,12 @@ async def ingest_file_endpoint(
             mime_type=parsed.mime_type,
             metadata=merged_metadata,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise _service_error(exc) from exc
+    finally:
+        await file.close()
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
@@ -285,6 +292,7 @@ def enterprise_quality_endpoint(request: EnterpriseQualityRequest) -> Enterprise
             text=request.text,
             document_id=request.document_id,
             auto_mask_pii=request.auto_mask_pii,
+            apply_local_term_replacements=request.apply_local_term_replacements,
         )
     except Exception as exc:
         raise _service_error(exc) from exc
