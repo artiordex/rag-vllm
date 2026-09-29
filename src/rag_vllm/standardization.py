@@ -1,6 +1,7 @@
-"""Enterprise data standardization and PII (Privacy) detection & masking module.
+"""Local heuristic PII candidate scanning and example term mapping.
 
-Complies with Korean Public Data Quality Guidelines (행정안전부 공공데이터 품질관리 실태평가).
+This module is exploratory. Its regexes and built-in synonym list are not an
+official standard dictionary, a compliance score, or an approval decision.
 """
 
 from __future__ import annotations
@@ -40,63 +41,54 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
     Returns:
         (processed_text, detected_issues_list)
     """
-    detected: list[dict[str, Any]] = []
+    priorities = (
+        "주민등록번호",
+        "외국인등록번호",
+        "휴대전화번호",
+        "일반전화번호",
+        "이메일주소",
+        "신용카드번호",
+        "계좌번호",
+    )
+
+    def masked_value(category: str, match: re.Match[str]) -> str:
+        groups = match.groups()
+        if category in {"주민등록번호", "외국인등록번호"}:
+            return f"{groups[0]}-{groups[1][0]}******"
+        if category == "휴대전화번호":
+            return f"{groups[0]}-****-{groups[2]}"
+        if category == "일반전화번호":
+            return f"{groups[0]}-****-{groups[2]}"
+        if category == "이메일주소":
+            user, domain = groups
+            masked_user = user[:2] + "***" if len(user) > 2 else user[0] + "***"
+            return f"{masked_user}@{domain}"
+        if category == "신용카드번호":
+            return f"{groups[0]}-****-****-{groups[3]}"
+        # 계좌번호 패턴은 기관별 형식이 달라 heuristic mask로만 다룬다.
+        return f"{groups[0]}-****-**{groups[2][-2:]}"
+
+    matches: list[tuple[int, int, str, str, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for category in priorities:
+        for match in PII_PATTERNS[category].finditer(text):
+            start, end = match.span()
+            if any(start < used_end and end > used_start for used_start, used_end in occupied):
+                continue
+            occupied.append((start, end))
+            matches.append((start, end, category, match.group(0), masked_value(category, match)))
+
+    matches.sort(key=lambda item: item[0])
+    detected = [
+        {"category": category, "snippet": replacement, "position": start, "end": end}
+        for start, end, category, _original, replacement in matches
+    ]
+    if not mask:
+        return text, detected
+
     masked_text = text
-
-    # 1. 주민등록번호 (앞 6자리-뒷 첫째자리 이후 마스킹: 900101-1******)
-    def mask_rrn(m: re.Match) -> str:
-        detected.append({
-            "category": "주민등록번호",
-            "snippet": f"{m.group(1)}-{m.group(2)[0]}******",
-            "position": m.start(),
-        })
-        return f"{m.group(1)}-{m.group(2)[0]}******" if mask else m.group(0)
-
-    masked_text = PII_PATTERNS["주민등록번호"].sub(mask_rrn, masked_text)
-
-    # 2. 외국인등록번호
-    def mask_frn(m: re.Match) -> str:
-        detected.append({
-            "category": "외국인등록번호",
-            "snippet": f"{m.group(1)}-{m.group(2)[0]}******",
-            "position": m.start(),
-        })
-        return f"{m.group(1)}-{m.group(2)[0]}******" if mask else m.group(0)
-
-    masked_text = PII_PATTERNS["외국인등록번호"].sub(mask_frn, masked_text)
-
-    # 3. 휴대전화번호 (가운데 자리 마스킹: 010-****-5678)
-    def mask_phone(m: re.Match) -> str:
-        detected.append({
-            "category": "휴대전화번호",
-            "snippet": f"{m.group(1)}-****-{m.group(3)}",
-            "position": m.start(),
-        })
-        return f"{m.group(1)}-****-{m.group(3)}" if mask else m.group(0)
-
-    masked_text = PII_PATTERNS["휴대전화번호"].sub(mask_phone, masked_text)
-
-    # 4. 이메일 (아이디 앞 2자리 외 마스킹: te***@domain.com)
-    def mask_email(m: re.Match) -> str:
-        user, domain = m.group(1), m.group(2)
-        masked_user = user[:2] + "***" if len(user) > 2 else user[0] + "***"
-        snippet = f"{masked_user}@{domain}"
-        detected.append({"category": "이메일주소", "snippet": snippet, "position": m.start()})
-        return snippet if mask else m.group(0)
-
-    masked_text = PII_PATTERNS["이메일주소"].sub(mask_email, masked_text)
-
-    # 5. 카드번호
-    def mask_card(m: re.Match) -> str:
-        detected.append({
-            "category": "신용카드번호",
-            "snippet": f"{m.group(1)}-****-****-{m.group(4)}",
-            "position": m.start(),
-        })
-        return f"{m.group(1)}-****-****-{m.group(4)}" if mask else m.group(0)
-
-    masked_text = PII_PATTERNS["신용카드번호"].sub(mask_card, masked_text)
-
+    for start, end, _category, _original, replacement in reversed(matches):
+        masked_text = masked_text[:start] + replacement + masked_text[end:]
     return masked_text, detected
 
 
@@ -122,7 +114,10 @@ ADMINISTRATIVE_SYNONYMS = {
 
 
 def standardize_administrative_terms(text: str) -> tuple[str, dict[str, int]]:
-    """Replace non-standard administrative colloquialisms with official government standard terms.
+    """Apply the small built-in synonym list and return replacement counts.
+
+    Matches are local candidates, not official dictionary matches. Review them
+    with the responsible domain owner before applying them as standards.
 
     Returns:
         (standardized_text, {replaced_term: count})
@@ -148,8 +143,13 @@ def evaluate_enterprise_quality(
     text: str,
     source_name: str = "",
     auto_mask_pii: bool = True,
+    apply_local_term_replacements: bool = True,
 ) -> dict[str, Any]:
-    """Calculate comprehensive quality metrics based on government DQC standards.
+    """Calculate an internal heuristic report for unstructured text.
+
+    The five score buckets are illustrative and do not implement or certify a
+    government quality standard. Regex matches and local term candidates are
+    not equivalent to verified privacy clearance or approved standardization.
 
     Pillars:
     1. 완전성 (Completeness): 누락 및 빈 줄 비율
@@ -162,7 +162,8 @@ def evaluate_enterprise_quality(
     masked_text, pii_issues = detect_and_mask_pii(text, mask=auto_mask_pii)
 
     # Step 2: Terminology Standardization Scan
-    clean_text, term_replacements = standardize_administrative_terms(masked_text)
+    suggested_text, term_replacements = standardize_administrative_terms(masked_text)
+    clean_text = suggested_text if apply_local_term_replacements else masked_text
 
     # Metrics
     char_count = len(clean_text)
@@ -178,7 +179,7 @@ def evaluate_enterprise_quality(
     dup_ratio = (duplicate_line_count / non_empty_count) if non_empty_count else 0.0
 
     # Contaminations
-    replacement_count = clean_text.count("")
+    replacement_count = clean_text.count("\uFFFD")
     control_count = sum(1 for c in clean_text if ord(c) < 32 and c not in {"\n", "\t"})
     blank_ratio = ((line_count - non_empty_count) / line_count) if line_count else 0.0
 
@@ -230,16 +231,29 @@ def evaluate_enterprise_quality(
 
     recommendations: list[str] = []
     if pii_issues:
-        recommendations.append(f"개인정보(주민등록번호 등 {len(pii_issues)}건)가 발견되어 자동 비식별화 마스킹 조치되었습니다.")
+        if auto_mask_pii:
+            recommendations.append(
+                f"규칙 기반 개인정보 후보 {len(pii_issues)}건을 마스킹했습니다. 완전한 비식별화 여부는 별도 검토가 필요합니다."
+            )
+        else:
+            recommendations.append(
+                f"규칙 기반 개인정보 후보 {len(pii_issues)}건을 찾았습니다. 원문은 마스킹하지 않았습니다."
+            )
     if term_replacements:
-        recommendations.append(f"비표준 행정 용어 {len(term_replacements)}종이 행정안전부 표준용어로 자동 보정되었습니다.")
+        action = "적용했습니다" if apply_local_term_replacements else "후보로 찾았습니다"
+        recommendations.append(
+            f"rag-vllm 내장 용어 목록에서 치환 후보 {len(term_replacements)}종을 {action}. 공식 표준사전 검증이나 승인은 아닙니다."
+        )
     if replacement_count:
-        recommendations.append("인코딩 손상 문자()가 감지되었습니다. 파일 저장 인코딩을 UTF-8로 확인하십시오.")
+        recommendations.append(
+            f"인코딩 손상 대체 문자(U+FFFD) {replacement_count}개가 감지되었습니다. 파일 저장 인코딩을 확인하십시오."
+        )
     if dup_ratio >= 0.15:
         recommendations.append("중복 문단 비율이 높습니다. 본문 텍스트의 중복 추출 여부를 점검하십시오.")
 
     return {
         "score": total_score,
+        "assessment_scope": "rag-vllm-local-heuristic-not-official",
         "grade": grade,
         "status": status,
         "pillars": {
@@ -253,6 +267,11 @@ def evaluate_enterprise_quality(
         "pii_details": pii_issues,
         "standardized_terms_count": len(term_replacements),
         "standardized_terms": term_replacements,
+        "standardization_status": "local_candidates_pending_review",
+        "standardization_source": "rag-vllm_builtin_synonyms",
+        "standardization_applied": apply_local_term_replacements,
+        "pii_scan_scope": "heuristic_pattern_match",
+        "pii_masking_applied": auto_mask_pii,
         "recommendations": recommendations,
         "cleaned_text": clean_text,
     }
