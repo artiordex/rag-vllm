@@ -24,7 +24,9 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-_BOUNDARY = re.compile(r"\n\n|(?<=[.!?。！？])\s+|\n")
+_BOUNDARY = re.compile(
+    r"\n\n|\n(?=[0-9]+\.\s|[가-하]\.\s|\([0-9]+\)\s|\([가-하]\)\s|제[0-9]+조)|(?<=[.!?。！？])\s+|\n"
+)
 
 
 def _best_boundary(text: str, start: int, end: int) -> int:

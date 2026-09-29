@@ -15,6 +15,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.34.0",
+    "pillow>=12.3.0",
 ]
 
 [project.scripts]
@@ -24,3 +25,8 @@ rag-vllm-api = "rag_vllm.api:run"
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

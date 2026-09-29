@@ -94,12 +94,77 @@ def _parse_docx(payload: bytes) -> ParsedDocument:
     )
 
 
+def _parse_hwpx(payload: bytes) -> ParsedDocument:
+    """Extract text and tables from KS X 6101 HWPX (Hancom Word Open Container)."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(BytesIO(payload)) as zf:
+            section_names = sorted(
+                [name for name in zf.namelist() if "section" in name.lower() and name.endswith(".xml")]
+            )
+            if not section_names:
+                raise ParseError("유효한 HWPX 섹션(section.xml)을 찾을 수 없습니다.")
+
+            lines: list[str] = []
+            table_count = 0
+
+            for sec_name in section_names:
+                xml_data = zf.read(sec_name)
+                root = ET.fromstring(xml_data)
+
+                def _lt(e: ET.Element) -> str:
+                    return e.tag.split("}")[-1] if "}" in e.tag else e.tag
+
+                # 표 셀(tc) 내부 요소들을 미리 집합으로 모아 일반 문단과 중복 추출 방지
+                tc_descendants = set()
+                for tc in root.iter():
+                    if _lt(tc) == "tc":
+                        for c in tc.iter():
+                            if c is not tc:
+                                tc_descendants.add(id(c))
+
+                for elem in root.iter():
+                    if id(elem) in tc_descendants:
+                        continue
+                    tag = _lt(elem)
+                    if tag == "tbl":
+                        table_count += 1
+                        for tr in elem.iter():
+                            if _lt(tr) == "tr":
+                                cells: list[str] = []
+                                for tc in tr:
+                                    if _lt(tc) == "tc":
+                                        cell_text = "".join(
+                                            t.text or "" for t in tc.iter() if _lt(t) == "t" and t.text
+                                        ).strip()
+                                        cells.append(cell_text)
+                                if any(cells):
+                                    lines.append("| " + " | ".join(cells) + " |")
+                    elif tag == "p":
+                        if not any(_lt(c) == "tbl" for c in elem.iter()):
+                            p_text = "".join(t.text or "" for t in elem.iter() if _lt(t) == "t" and t.text).strip()
+                            if p_text:
+                                lines.append(p_text)
+
+            full_text = normalize_text("\n\n".join(lines))
+            return ParsedDocument(
+                text=full_text,
+                mime_type="application/hwp+zip",
+                metadata={"table_count": table_count, "section_count": len(section_names)},
+            )
+    except zipfile.BadZipFile as exc:
+        raise ParseError("손상되었거나 유효하지 않은 HWPX(ZIP) 파일입니다.") from exc
+    except Exception as exc:
+        raise ParseError(f"HWPX 파싱 실패: {exc}") from exc
+
+
 def parse_document(filename: str, payload: bytes, content_type: str | None = None) -> ParsedDocument:
     """Extract text from supported files.
 
-    Scanned PDFs and HWP files need an OCR/HWP-specific adapter and are
-    deliberately reported as unsupported/empty rather than silently indexed as
-    garbage.
+    Scanned PDFs and legacy binary HWP files need OCR/binary adapters and are
+    deliberately reported as unsupported rather than silently indexed as garbage.
     """
 
     suffix = PurePath(filename or "").suffix.lower()
@@ -109,6 +174,8 @@ def parse_document(filename: str, payload: bytes, content_type: str | None = Non
         return _parse_pdf(payload)
     if suffix == ".docx":
         return _parse_docx(payload)
+    if suffix == ".hwpx" or mime_type in {"application/hwp+zip", "application/haansofthwpx"}:
+        return _parse_hwpx(payload)
     if suffix in {".html", ".htm"} or mime_type == "text/html":
         parser = _HTMLTextExtractor()
         parser.feed(_decode_bytes(payload))
@@ -121,7 +188,13 @@ def parse_document(filename: str, payload: bytes, content_type: str | None = Non
         except json.JSONDecodeError:
             text = raw
         return ParsedDocument(normalize_text(text), "application/json")
-    if suffix in {".hwp", ".hwpx"}:
-        raise ParseError("HWP/HWPX는 현재 기본 파서에 포함되지 않았습니다. HWPX 또는 OCR 어댑터를 추가하세요.")
+    if suffix == ".hwp":
+        raise ParseError("레거시 바이너리 HWP 형식입니다. 공공 표준인 HWPX로 변환하여 업로드하세요.")
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+    if suffix in IMAGE_EXTENSIONS or (mime_type and mime_type.startswith("image/")):
+        from .multimodal import parse_image_document
+
+        text, meta = parse_image_document(filename, payload, mime_type)
+        return ParsedDocument(text=text, mime_type=mime_type or f"image/{suffix.lstrip('.')}", metadata=meta)
 
     return ParsedDocument(normalize_text(_decode_bytes(payload)), mime_type or "text/plain")

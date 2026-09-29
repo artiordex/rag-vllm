@@ -16,12 +16,13 @@ services:
     image: "${VLLM_IMAGE:-vllm/vllm-openai:latest}"
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${VLLM_HOST_PORT:-8001}:8000"
+      - "127.0.0.1:${VLLM_HOST_PORT:-11435}:8000"
     environment:
       HF_TOKEN: "${HF_TOKEN:-}"
     volumes:
       - ragvllm-huggingface-cache:/root/.cache/huggingface
       - ragvllm-compile-cache:/root/.cache/vllm
+      - ./data/lora:/root/lora-adapters:ro
     ipc: host
     gpus: all
     command:
@@ -30,12 +31,18 @@ services:
       - "${VLLM_SERVED_MODEL_NAME:-rag-vllm-model}"
       - "--max-model-len"
       - "${VLLM_MAX_MODEL_LEN:-8192}"
+      - "--gpu-memory-utilization"
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
       - "--api-key"
       - "${VLLM_API_KEY:-vllm-local}"
       - "--host"
       - "0.0.0.0"
       - "--port"
       - "8000"
+      # To enable dynamic LoRA adapters at runtime, uncomment below:
+      # - "--enable-lora"
+      # - "--max-loras"
+      # - "4"
 
 volumes:
   ragvllm-postgres:

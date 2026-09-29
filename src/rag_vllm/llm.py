@@ -26,7 +26,7 @@ class LLMClient:
     def configured(self) -> bool:
         return bool(self.settings.llm_base_url and self.settings.llm_model)
 
-    def complete(self, question: str, context: str) -> str | None:
+    def complete(self, question: str, context: str, system_prompt: str | None = None) -> str | None:
         if not self.configured:
             return None
 
@@ -36,11 +36,13 @@ class LLMClient:
         if self.settings.llm_api_key:
             headers["Authorization"] = f"Bearer {self.settings.llm_api_key}"
 
-        system_prompt = (
-            "당신은 근거 기반 RAG 도우미다. 제공된 CONTEXT만 사용해 답변하라. "
-            "근거가 부족하면 모른다고 말하고 추측하지 마라. "
-            "답변에 사용한 근거 번호를 [1], [2] 형식으로 표시하라."
-        )
+        if not system_prompt:
+            system_prompt = (
+                "당신은 근거 기반 RAG 도우미다. 제공된 CONTEXT만 사용해 답변하라. "
+                "근거가 부족하면 모른다고 말하고 추측하지 마라. "
+                "답변에 사용한 근거 번호를 [1], [2] 형식으로 표시하라."
+            )
+        user_content = f"CONTEXT:\n{context}\n\nQUESTION:\n{question}" if context.strip() else question
         payload: dict[str, Any] = {
             "model": self.settings.llm_model,
             "temperature": 0,
@@ -48,7 +50,7 @@ class LLMClient:
             "chat_template_kwargs": {"enable_thinking": False},
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION:\n{question}"},
+                {"role": "user", "content": user_content},
             ],
         }
         try:
