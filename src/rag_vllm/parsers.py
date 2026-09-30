@@ -1,4 +1,13 @@
-"""Text extraction for common unstructured document formats."""
+# =============================================================================
+# 파일명: parsers.py
+# 경로: src/rag_vllm/parsers.py
+# 목적: 텍스트·PDF·DOCX·HWPX·이미지 문서 추출과 입력 한도 적용함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
+
+"""텍스트·PDF·DOCX·HWPX·이미지 문서 추출과 입력 한도 적용함"""
 
 from __future__ import annotations
 
@@ -10,7 +19,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import PurePath
 
-from .chunking import normalize_text
+from .chunking import MAX_TEXT_CHARACTERS, normalize_text
 
 MAX_DOCUMENT_INPUT_BYTES = 25 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 2_048
@@ -20,40 +29,53 @@ MAX_PDF_PAGES = 2_000
 
 
 class ParseError(ValueError):
-    """Raised when a file cannot be converted into text."""
+    """파일을 안전하게 텍스트로 변환하지 못했음을 나타내는 예외임"""
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedDocument:
+    """추출 텍스트와 파서가 확인한 MIME·문서 메타데이터를 보관함"""
+
     text: str
     mime_type: str | None
     metadata: dict[str, object] = field(default_factory=dict)
 
 
 class _HTMLTextExtractor(HTMLParser):
+    """스크립트·스타일을 제외하고 HTML 본문 경계를 보존해 추출함"""
+
     def __init__(self) -> None:
+        """HTML 텍스트 조각과 무시 중인 스크립트 깊이를 초기화함"""
         super().__init__()
         self.parts: list[str] = []
         self._ignored_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """HTML 시작 태그에 따라 본문 경계 또는 무시 깊이를 갱신함"""
         if tag.lower() in {"script", "style", "noscript"}:
             self._ignored_depth += 1
         elif tag.lower() in {"p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        """HTML 종료 태그에 따라 본문 경계를 추가하거나 무시 깊이를 줄임"""
         if tag.lower() in {"script", "style", "noscript"} and self._ignored_depth:
             self._ignored_depth -= 1
         elif tag.lower() in {"p", "div", "li", "tr", "h1", "h2", "h3", "h4"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        """스크립트·스타일 바깥의 텍스트 데이터만 수집함"""
         if not self._ignored_depth:
             self.parts.append(data)
 
 
 def _check_archive_limits(archive: zipfile.ZipFile) -> None:
+    """문서 ZIP 구성원 수와 압축 해제 크기로 폭탄형 입력을 차단함
+
+    Raises:
+        ParseError: 압축 파일이 구성원·단일 항목·전체 크기 한도를 초과할 때 발생함
+    """
     members = archive.infolist()
     if len(members) > MAX_ARCHIVE_MEMBERS:
         raise ParseError("문서 압축 파일의 항목 수가 허용 한도를 초과했습니다.")
@@ -64,7 +86,12 @@ def _check_archive_limits(archive: zipfile.ZipFile) -> None:
 
 
 def _with_parser_metadata(parsed: ParsedDocument, parser: str) -> ParsedDocument:
+    """추출 결과를 정규화하고 파서·문자 수·상태 메타데이터를 덧붙임"""
+    if len(parsed.text) > MAX_TEXT_CHARACTERS:
+        raise ParseError(f"추출 텍스트가 허용 한도({MAX_TEXT_CHARACTERS}자)를 초과했습니다.")
     text = normalize_text(parsed.text)
+    if len(text) > MAX_TEXT_CHARACTERS:
+        raise ParseError(f"추출 텍스트가 허용 한도({MAX_TEXT_CHARACTERS}자)를 초과했습니다.")
     metadata = {
         **parsed.metadata,
         "parser": parser,
@@ -75,6 +102,7 @@ def _with_parser_metadata(parsed: ParsedDocument, parser: str) -> ParsedDocument
 
 
 def _decode_bytes(payload: bytes) -> str:
+    """한국어 문서에서 자주 쓰이는 인코딩 순서로 바이트를 디코딩함"""
     for encoding in ("utf-8-sig", "cp949", "euc-kr", "utf-16", "latin-1"):
         try:
             return payload.decode(encoding)
@@ -84,23 +112,34 @@ def _decode_bytes(payload: bytes) -> str:
 
 
 def _parse_pdf(payload: bytes) -> ParsedDocument:
+    """PDF 페이지별 텍스트를 추출하고 페이지·문자 수 한도를 검증함
+
+    Raises:
+        ParseError: 의존성·페이지 수·추출 문자 수·PDF 구조가 허용 범위를
+            벗어날 때 발생함
+    """
     try:
         from pypdf import PdfReader
-    except ImportError as exc:  # pragma: no cover - dependency is declared
+    except ImportError as exc:  # NOTE: 선언된 PDF 의존성이 테스트 환경에서 누락된 경우만 해당함
         raise ParseError("PDF 파싱을 위해 pypdf를 설치해야 합니다.") from exc
 
-    reader = PdfReader(BytesIO(payload))
-    if len(reader.pages) > MAX_PDF_PAGES:
-        raise ParseError(f"PDF 페이지 수가 허용 한도({MAX_PDF_PAGES})를 초과했습니다.")
-    pages: list[str] = []
-    extracted_characters = 0
-    for page_number, page in enumerate(reader.pages, start=1):
-        page_text = normalize_text(page.extract_text() or "")
-        if page_text:
-            extracted_characters += len(page_text)
-            if extracted_characters > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
-                raise ParseError("PDF에서 추출한 텍스트가 허용 한도를 초과했습니다.")
-            pages.append(f"[Page {page_number}]\n{page_text}")
+    try:
+        reader = PdfReader(BytesIO(payload))
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise ParseError(f"PDF 페이지 수가 허용 한도({MAX_PDF_PAGES})를 초과했습니다.")
+        pages: list[str] = []
+        extracted_characters = 0
+        for page_number, page in enumerate(reader.pages, start=1):
+            page_text = normalize_text(page.extract_text() or "")
+            if page_text:
+                extracted_characters += len(page_text)
+                if extracted_characters > MAX_TEXT_CHARACTERS:
+                    raise ParseError("PDF에서 추출한 텍스트가 허용 한도를 초과했습니다.")
+                pages.append(f"[Page {page_number}]\n{page_text}")
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError("PDF 문서를 읽을 수 없습니다.") from exc
     return ParsedDocument(
         text=normalize_text("\n\n".join(pages)),
         mime_type="application/pdf",
@@ -109,9 +148,14 @@ def _parse_pdf(payload: bytes) -> ParsedDocument:
 
 
 def _parse_docx(payload: bytes) -> ParsedDocument:
+    """DOCX 문단과 표 셀을 텍스트로 추출하고 압축 구조를 먼저 검증함
+
+    Raises:
+        ParseError: 의존성·압축 구조·문서 파싱·본문 크기 검증에 실패할 때 발생함
+    """
     try:
         from docx import Document
-    except ImportError as exc:  # pragma: no cover - dependency is declared
+    except ImportError as exc:  # NOTE: 선언된 DOCX 의존성이 테스트 환경에서 누락된 경우만 해당함
         raise ParseError("DOCX 파싱을 위해 python-docx를 설치해야 합니다.") from exc
 
     try:
@@ -138,7 +182,11 @@ def _parse_docx(payload: bytes) -> ParsedDocument:
 
 
 def _parse_hwpx(payload: bytes) -> ParsedDocument:
-    """Extract text and tables from KS X 6101 HWPX (Hancom Word Open Container)."""
+    """KS X 6101 HWPX에서 문단과 표를 추출함
+
+    Raises:
+        ParseError: HWPX 압축 구조나 XML 섹션이 유효하지 않을 때 발생함
+    """
     import xml.etree.ElementTree as ET
     try:
         with zipfile.ZipFile(BytesIO(payload)) as zf:
@@ -157,6 +205,7 @@ def _parse_hwpx(payload: bytes) -> ParsedDocument:
                 root = ET.fromstring(xml_data)
 
                 def _lt(e: ET.Element) -> str:
+                    """네임스페이스가 있는 HWPX 태그에서 로컬 이름만 추출함"""
                     return e.tag.split("}")[-1] if "}" in e.tag else e.tag
 
                 # 표 셀(tc) 내부 요소들을 미리 집합으로 모아 일반 문단과 중복 추출 방지
@@ -203,10 +252,22 @@ def _parse_hwpx(payload: bytes) -> ParsedDocument:
 
 
 def parse_document(filename: str, payload: bytes, content_type: str | None = None) -> ParsedDocument:
-    """Extract text from supported files.
+    """지원 파일에서 텍스트를 추출하고 검색에 넣을 수 있는 형태로 반환함
 
-    Scanned PDFs and legacy binary HWP files need OCR/binary adapters and are
-    deliberately reported as unsupported rather than silently indexed as garbage.
+    Args:
+        filename: 업로드 파일명으로 확장자 판별에 사용함
+        payload: 제한 검증을 거친 파일 바이트임
+        content_type: 업로드가 제공한 MIME 타입임
+
+    Returns:
+        ParsedDocument: 정규화 텍스트, MIME 타입과 파서 메타데이터임
+
+    Raises:
+        ParseError: 파일 크기·형식·추출 결과가 지원 범위를 벗어날 때 발생함
+
+    Caveats:
+        스캔 PDF와 레거시 HWP는 OCR 또는 전용 어댑터 없이는 조용히 잘못
+        색인하지 않도록 명시적으로 지원하지 않음
     """
 
     if len(payload) > MAX_DOCUMENT_INPUT_BYTES:

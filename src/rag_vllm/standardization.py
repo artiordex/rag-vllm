@@ -1,7 +1,15 @@
-"""Local heuristic PII candidate scanning and example term mapping.
+# =============================================================================
+# 파일명: standardization.py
+# 경로: src/rag_vllm/standardization.py
+# 목적: 개인정보 후보 탐지·마스킹과 예시 용어 표준화·품질 평가 수행함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
 
-This module is exploratory. Its regexes and built-in synonym list are not an
-official standard dictionary, a compliance score, or an approval decision.
+"""개인정보 후보 탐지·마스킹과 예시 용어 표준화·품질 평가 수행함
+
+공식 사전·품질 점수·승인 판정이 아닌 탐색용 규칙으로 동작함
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ from typing import Any
 from .chunking import MAX_TEXT_CHARACTERS
 
 # =====================================================================
-# 1. Heuristic patterns for common Korean identifiers and contact fields
+# 1. 국내 식별자·연락처 후보를 탐지하기 위한 휴리스틱 패턴
 # =====================================================================
 
 PII_PATTERNS = {
@@ -27,10 +35,17 @@ PII_PATTERNS = {
 
 
 def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[str, Any]]]:
-    """Detect PII (Personal Identifiable Information) and optionally mask it.
+    """개인정보 후보를 탐지하고 선택적으로 가림 처리함
+
+    Args:
+        text: 개인정보 후보를 탐지할 원문임
+        mask: 탐지된 값을 가릴지 여부임
 
     Returns:
-        (processed_text, detected_issues_list)
+        tuple[str, list[dict[str, Any]]]: 처리 본문과 탐지 위치 목록임
+
+    Caveats:
+        정규식 기반 후보 탐지이므로 완전한 비식별화나 법적 안전 판정이 아님
     """
     priorities = (
         "주민등록번호",
@@ -43,6 +58,7 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
     )
 
     def masked_value(category: str, match: re.Match[str]) -> str:
+        """탐지 유형별 개인정보 표시 규칙을 적용한 대체값을 생성함"""
         groups = match.groups()
         if category in {"주민등록번호", "외국인등록번호"}:
             return f"{groups[0]}-{groups[1][0]}******"
@@ -56,7 +72,7 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
             return f"{masked_user}@{domain}"
         if category == "신용카드번호":
             return f"{groups[0]}-****-****-{groups[3]}"
-        # 계좌번호 패턴은 기관별 형식이 달라 heuristic mask로만 다룬다.
+        # NOTE: 계좌번호 형식은 기관별 차이가 있어 보수적인 부분 마스킹만 적용함
         return f"{groups[0]}-****-**{groups[2][-2:]}"
 
     candidates: list[tuple[int, int, int, str, str]] = []
@@ -89,11 +105,11 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
 
 
 # =====================================================================
-# 2. Local example synonyms (official dictionary matching is not implemented here)
+# 2. 공식 사전이 아닌 로컬 예시 용어 매핑
 # =====================================================================
 
 ADMINISTRATIVE_SYNONYMS = {
-    # Illustrative local replacements; not authoritative dictionary entries.
+    # NOTE: 공식 표준사전 항목이 아니므로 업무 적용 전 담당자 검토가 필요함
     "주소록": "연락처목록",
     "과태금": "과태료",
     "주민번호": "주민등록번호",
@@ -110,13 +126,13 @@ ADMINISTRATIVE_SYNONYMS = {
 
 
 def standardize_administrative_terms(text: str) -> tuple[str, dict[str, int]]:
-    """Apply the small built-in synonym list and return replacement counts.
+    """내장 예시 용어 목록을 적용하고 치환 횟수를 반환함
 
-    Matches are local candidates, not official dictionary matches. Review them
-    with the responsible domain owner before applying them as standards.
+    로컬 후보는 공식 표준사전 일치 결과가 아니므로 표준어로 적용하기 전에
+    담당 도메인 소유자의 검토가 필요함
 
     Returns:
-        (standardized_text, {replaced_term: count})
+        tuple[str, dict[str, int]]: 치환 본문과 원어·표준어별 횟수임
     """
     standardized = text
     replacement_counts: dict[str, int] = {}
@@ -132,7 +148,7 @@ def standardize_administrative_terms(text: str) -> tuple[str, dict[str, int]]:
 
 
 # =====================================================================
-# 3. Internal illustrative quality buckets (not an official DQC score)
+# 3. 공식 DQC 점수가 아닌 내부 참고용 품질 구간
 # =====================================================================
 
 def evaluate_enterprise_quality(
@@ -141,77 +157,82 @@ def evaluate_enterprise_quality(
     auto_mask_pii: bool = True,
     apply_local_term_replacements: bool = True,
 ) -> dict[str, Any]:
-    """Calculate an internal heuristic report for unstructured text.
+    """비정형 텍스트에 개인정보·용어·중복 규칙을 적용해 참고 리포트를 산출함
 
-    The five score buckets are illustrative and do not implement or certify a
-    government quality standard. Regex matches and local term candidates are
-    not equivalent to verified privacy clearance or approved standardization.
+    Args:
+        text: 진단할 원문 텍스트임
+        source_name: 리포트에 기록할 원천 이름임
+        auto_mask_pii: 개인정보 후보를 결과 본문에서 가릴지 여부임
+        apply_local_term_replacements: 로컬 예시 용어 치환을 결과 본문에 적용할지 여부임
 
-    Pillars:
-    1. 완전성 (Completeness): 누락 및 빈 줄 비율
-    2. 유효성 (Validity): 날짜 형식 및 제어문자 오염도
-    3. 일관성 (Consistency): 중복 문단 비율
-    4. 개인정보 후보 신호: 규칙 기반 문자열 탐지와 선택적 마스킹 시도
-    5. 정확성 (Accuracy): 비정상 인코딩 및 기호 깨짐 여부
+    Returns:
+        dict[str, Any]: 내부 참고 점수와 개인정보·용어 탐지 결과임
+
+    Raises:
+        ValueError: 입력 텍스트가 최대 문자 수를 초과할 때 발생함
+
+    Caveats:
+        다섯 점수 구간은 정부 품질 표준 인증이나 개인정보 완전 비식별화
+        판정과 동일하지 않음
     """
     if len(text) > MAX_TEXT_CHARACTERS:
         raise ValueError(f"진단 텍스트가 허용 한도({MAX_TEXT_CHARACTERS}자)를 초과했습니다.")
 
-    # Step 1: PII Scan
+    # NOTE: 개인정보 후보를 먼저 처리해 이후 품질 계산에 원문 노출을 줄임
     masked_text, pii_issues = detect_and_mask_pii(text, mask=auto_mask_pii)
 
-    # Step 2: Terminology Standardization Scan
+    # NOTE: 표준화 후보는 공식 사전이 아니므로 설정에 따라 적용 여부를 분리함
     suggested_text, term_replacements = standardize_administrative_terms(masked_text)
     clean_text = suggested_text if apply_local_term_replacements else masked_text
 
-    # Metrics
+    # 진단 지표 계산함
     char_count = len(clean_text)
     lines = clean_text.splitlines() if clean_text else []
     non_empty_lines = [l.strip() for l in lines if l.strip()]
     line_count = len(lines)
     non_empty_count = len(non_empty_lines)
 
-    # Duplicate check
+    # 반복 문단 비율 계산함
     from collections import Counter
     counts = Counter(non_empty_lines)
     duplicate_line_count = sum(c - 1 for c in counts.values() if c > 1)
     dup_ratio = (duplicate_line_count / non_empty_count) if non_empty_count else 0.0
 
-    # Contaminations
+    # 인코딩 대체 문자와 제어문자 오염 계산함
     replacement_count = clean_text.count("\uFFFD")
     control_count = sum(1 for c in clean_text if ord(c) < 32 and c not in {"\n", "\t"})
     blank_ratio = ((line_count - non_empty_count) / line_count) if line_count else 0.0
 
-    # Pillar Scores (out of 20 each, total 100)
-    # 1. Completeness (완전성)
+    # NOTE: 내부 참고용 5개 축 20점씩의 100점 체계임
+    # 1. 완전성 점수 계산함
     score_completeness = 20
     if char_count < 100:
         score_completeness -= 10
     if blank_ratio > 0.4:
         score_completeness -= 5
 
-    # 2. Validity (유효성)
+    # 2. 유효성 점수 계산함
     score_validity = 20
     if control_count > 0:
         score_validity -= min(10, control_count)
 
-    # 3. Consistency (일관성)
+    # 3. 일관성 점수 계산함
     score_consistency = 20
     if dup_ratio >= 0.25:
         score_consistency -= 12
     elif dup_ratio >= 0.10:
         score_consistency -= 5
 
-    # 4. Integrity (무결성 - PII)
+    # 4. 개인정보 후보 무결성 점수 계산함
     score_integrity = 20
     if pii_issues:
-        # PII found: alert on unmasked or reward for auto-masked
+        # SECURITY: 마스킹을 끄면 원문 개인정보 후보가 남을 수 있어 점수를 낮춤
         if not auto_mask_pii:
             score_integrity -= min(15, len(pii_issues) * 5)
         else:
-            score_integrity -= min(5, len(pii_issues))  # slight penalty for raw PII ingestion
+            score_integrity -= min(5, len(pii_issues))  # SECURITY: 자동 마스킹도 별도 검토 대상으로 표시함
 
-    # 5. Accuracy (정확성 - 인코딩 및 오염)
+    # 5. 정확성 점수 계산함
     score_accuracy = 20
     if replacement_count > 0:
         score_accuracy -= min(15, replacement_count * 3)

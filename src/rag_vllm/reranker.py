@@ -1,8 +1,13 @@
-"""2-Stage Retrieval Cross-Encoder Reranker Module.
+# =============================================================================
+# 파일명: reranker.py
+# 경로: src/rag_vllm/reranker.py
+# 목적: 검색 후보를 Cross-Encoder 또는 경량 휴리스틱으로 재정렬함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
 
-Stage 1: Hybrid pgvector cosine similarity + BM25-style keyword search (RRF)
-Stage 2: Deep cross-attention reranking using BAAI/bge-reranker or heuristic fallback
-"""
+"""검색 후보를 Cross-Encoder 또는 경량 휴리스틱으로 재정렬함"""
 
 from __future__ import annotations
 
@@ -17,7 +22,14 @@ _RERANKER_INSTANCE: Any = None
 
 
 def get_reranker(settings: Settings) -> Any:
-    """Return a singleton FlagReranker or None if disabled."""
+    """설정이 허용할 때 FlagReranker 단일 인스턴스를 지연 생성함
+
+    Returns:
+        Any: FlagReranker 인스턴스 또는 비활성화·로딩 실패 시 None임
+
+    Caveats:
+        무거운 모델을 프로세스 전역에 캐시하므로 GPU 메모리 사용량을 고려해야 함
+    """
     global _RERANKER_INSTANCE
 
     reranker_model = getattr(settings, "reranker_model", "BAAI/bge-reranker-base")
@@ -46,9 +58,20 @@ def rerank_chunks(
     top_k: int = 5,
     reranker: Any = None,
 ) -> list[dict[str, Any]]:
-    """Rerank candidate chunks using Cross-Encoder or contextual score fusion.
+    """검색 후보를 Cross-Encoder 또는 문맥 휴리스틱으로 재정렬함
 
-    Returns the top_k most relevant chunks sorted by reranked score.
+    Args:
+        query: 원래 사용자 질문임
+        candidates: 1차 검색 결과 후보 목록임
+        top_k: 반환할 최대 후보 수임
+        reranker: 선택적 Cross-Encoder 인스턴스임
+
+    Returns:
+        list[dict[str, Any]]: 재정렬 점수 내림차순 후보 목록임
+
+    Caveats:
+        신경망 리랭커 실패나 미설정 시 검색 경로 유지를 위해 휴리스틱으로
+        자동 전환함
     """
     if not candidates:
         return []
@@ -56,7 +79,7 @@ def rerank_chunks(
     if len(candidates) <= 1:
         return candidates[:top_k]
 
-    # Mode A: Neural Cross-Encoder Reranker
+    # NOTE: 사용자가 무거운 모델을 활성화한 경우 2단계 신경망 재정렬을 우선함
     if reranker is not None:
         try:
             pairs = [[query, c["text"]] for c in candidates]
@@ -76,7 +99,7 @@ def rerank_chunks(
         except Exception as exc:
             logger.warning("신경망 리랭킹 실패, 상호 순위 기반 정렬 유지: %s", exc)
 
-    # Mode B: High-Precision Heuristic & Exact Term Cross-Scoring
+    # NOTE: 모델 미사용·실패 시 API가 계속 응답하도록 정확 구문·용어·품질을 결합함
     query_terms = [t.strip().lower() for t in query.split() if len(t.strip()) >= 2]
     rescored = []
 
@@ -85,14 +108,14 @@ def rerank_chunks(
         base_score = float(item.get("score") or item.get("rrf_score", 0.5))
         text_lower = item["text"].lower()
 
-        # Bonus for exact query phrase match
+        # NOTE: 질문 전체가 포함된 후보는 짧은 질의에서 정밀도를 보강함
         exact_phrase_bonus = 0.20 if query.lower() in text_lower else 0.0
 
-        # Term density bonus
+        # NOTE: 질문 핵심어가 많이 포함된 후보를 보강함
         term_hits = sum(1 for term in query_terms if term in text_lower)
         term_ratio = (term_hits / len(query_terms)) if query_terms else 0.0
 
-        # Quality multiplier
+        # NOTE: 품질 점수가 낮은 문서가 검색 상위를 독점하지 않도록 감쇠함
         quality = item.get("quality_score") or 100
         quality_factor = quality / 100.0
 

@@ -1,20 +1,30 @@
-"""Embedded Web Dashboard for internal POC demonstrations."""
+# =============================================================================
+# 파일명: dashboard.py
+# 경로: src/rag_vllm/dashboard.py
+# 목적: 외부 정적 파일 없이 제공하는 내부 RAG POC 대시보드 생성함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
+
+"""외부 정적 파일 없이 제공하는 내부 RAG POC 대시보드 생성함"""
 
 from __future__ import annotations
 
 
 def get_dashboard_html() -> str:
-    """Return a single-page HTML dashboard for the rag-vllm service."""
+    """rag-vllm 서비스 상태와 문서·검색 기능을 제공하는 단일 페이지 HTML을 반환함"""
     return """<!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RAG-vLLM 문서 AI & 지능형 검색 포털 (POC)</title>
-  <!-- Tailwind CSS CDN -->
+  <!-- Tailwind CSS CDN 로드 영역 -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Marked.js for markdown rendering -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- 마크다운 렌더링용 Marked.js 로드 영역 -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@18.0.7/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js"></script>
   <style>
     @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
     body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; }
@@ -29,7 +39,7 @@ def get_dashboard_html() -> str:
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen flex flex-col">
 
-  <!-- Header -->
+  <!-- 헤더 영역 -->
   <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
       <div class="flex items-center justify-between h-16">
@@ -46,7 +56,7 @@ def get_dashboard_html() -> str:
           </div>
         </div>
 
-        <!-- Live Status Indicators -->
+        <!-- 실시간 상태 표시 영역 -->
         <div class="hidden md:flex items-center space-x-4 text-xs">
           <div class="flex items-center space-x-1.5 bg-slate-100 px-3 py-1.5 rounded-full border border-slate-200">
             <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" id="status-dot"></span>
@@ -59,14 +69,11 @@ def get_dashboard_html() -> str:
             <span class="text-slate-500">청크</span>
             <span class="font-bold text-slate-800" id="stat-chunks">-</span>
           </div>
-          <a href="/docs" target="_blank" class="text-blue-600 hover:text-blue-800 font-medium hover:underline flex items-center space-x-1">
-            <span>Swagger API</span>
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-          </a>
+          <span class="text-slate-500 font-medium">API 문서 비활성화</span>
         </div>
       </div>
 
-      <!-- Navigation Tabs -->
+      <!-- 탐색 탭 영역 -->
       <nav class="flex space-x-8 -mb-px">
         <button onclick="switchTab('search')" id="tab-search" class="tab-active py-3 px-1 text-sm font-medium border-b-2 flex items-center space-x-2">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
@@ -89,21 +96,29 @@ def get_dashboard_html() -> str:
           <span>시스템 & n8n 연동</span>
         </button>
       </nav>
+      <div class="flex flex-col sm:flex-row sm:items-center gap-2 border-t border-slate-100 py-2 text-xs">
+        <label for="api-key-input" class="font-medium text-slate-600">RAG API 키</label>
+        <input id="api-key-input" type="password" autocomplete="new-password" placeholder="키 설정 시 입력"
+               class="w-full sm:w-72 px-2.5 py-1.5 rounded border border-slate-300 text-xs">
+        <button onclick="saveApiKey()" class="px-3 py-1.5 rounded bg-slate-800 text-white hover:bg-slate-700">현재 탭에 저장</button>
+        <button onclick="clearApiKey()" class="px-3 py-1.5 rounded bg-slate-100 text-slate-700 hover:bg-slate-200">지우기</button>
+        <span id="api-key-status" class="text-slate-500">키는 이 페이지의 메모리에만 유지됩니다.</span>
+      </div>
     </div>
   </header>
 
-  <!-- Main Content Container -->
+  <!-- 본문 컨테이너 -->
   <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
 
     <!-- ========================================== -->
-    <!-- TAB 1: SMART SEARCH & RAG Q&A              -->
+    <!-- 탭 1: 지능형 검색과 RAG 질의응답 -->
     <!-- ========================================== -->
     <section id="panel-search" class="space-y-6">
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
         <h2 class="text-lg font-bold text-slate-900 mb-2">지능형 문서 검색 & RAG 질의응답</h2>
         <p class="text-sm text-slate-500 mb-4">공공 및 사내 규정 문서를 바탕으로 근거를 인용하여 정밀한 행정 답변을 생성합니다.</p>
 
-        <!-- Search Controls -->
+        <!-- 검색 제어 영역 -->
         <div class="space-y-4">
           <div class="flex flex-col sm:flex-row gap-3">
             <div class="flex-1 relative">
@@ -118,7 +133,7 @@ def get_dashboard_html() -> str:
             </button>
           </div>
 
-          <!-- Filter & Mode Badges -->
+          <!-- 필터·검색 모드 배지 영역 -->
           <div class="flex flex-wrap items-center gap-4 text-xs text-slate-600 pt-1">
             <div class="flex items-center space-x-2">
               <span class="font-medium text-slate-700">검색 방식:</span>
@@ -149,7 +164,7 @@ def get_dashboard_html() -> str:
             </div>
           </div>
 
-          <!-- Suggested Prompts -->
+          <!-- 추천 프롬프트 영역 -->
           <div class="flex flex-wrap items-center gap-2 pt-2">
             <span class="text-xs text-slate-400">추천 질문:</span>
             <button onclick="setQuery('식품위생법 위반 시 영업정지 및 과태료 행정처분 기준은 무엇인가요?')" class="text-xs bg-slate-100 hover:bg-blue-50 hover:text-blue-700 text-slate-600 px-2.5 py-1 rounded-full border border-slate-200 transition">
@@ -165,9 +180,9 @@ def get_dashboard_html() -> str:
         </div>
       </div>
 
-      <!-- Search Results Area -->
+      <!-- 검색 결과 영역 -->
       <div id="search-results-box" class="hidden space-y-6">
-        <!-- AI Answer Card -->
+        <!-- AI 답변 카드 -->
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
           <div class="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
             <div class="flex items-center space-x-2">
@@ -177,37 +192,37 @@ def get_dashboard_html() -> str:
             <span class="text-xs text-slate-400" id="search-elapsed"></span>
           </div>
           <div id="search-answer-content" class="prose-korean text-slate-800 text-sm leading-relaxed">
-            <!-- Answer rendered here -->
+            <!-- 답변을 렌더링하는 영역 -->
           </div>
         </div>
 
-        <!-- Retrieved Chunks Cards -->
+        <!-- 검색 청크 카드 영역 -->
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
           <h3 class="font-bold text-slate-900 mb-4 flex items-center space-x-2">
             <span>참조된 원문 근거 (Citations)</span>
             <span class="text-xs font-normal text-slate-400" id="search-citation-count"></span>
           </h3>
           <div id="search-sources-list" class="space-y-3">
-            <!-- Source cards injected here -->
+            <!-- 출처 카드를 삽입하는 영역 -->
           </div>
         </div>
       </div>
     </section>
 
     <!-- ========================================== -->
-    <!-- TAB 2: OFFICIAL DRAFTING STUDIO            -->
+    <!-- 탭 2: 공식 문서 초안 스튜디오 -->
     <!-- ========================================== -->
     <section id="panel-draft" class="hidden space-y-6">
       <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <!-- Input Form -->
+        <!-- 입력 양식 -->
         <div class="lg:col-span-5 bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
           <h2 class="text-lg font-bold text-slate-900">공문서·보고서 기안 양식 설정</h2>
-          <p class="text-sm text-slate-500">사내 RAG 문맥을 기반으로 공공기관/기업 표준 서식에 맞춰 공문서 초안을 자동 작성합니다.</p>
+          <p class="text-sm text-slate-500">사내 RAG 근거를 바탕으로 공문서 초안을 작성합니다. 생성 결과의 근거와 서식 적합성은 담당자가 검토해야 합니다.</p>
 
           <div>
             <label class="block text-xs font-bold text-slate-700 mb-1">문체 및 서식 스타일</label>
             <select id="draft-style" class="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:ring-2 focus:ring-blue-500">
-              <option value="공문서_개조식" selected>공문서 표준 개조식 (~추진함, 1. 가. (1) 번호체계)</option>
+              <option value="공문서_개조식" selected>공문서 개조식 초안 (~추진함, 1. 가. (1) 번호체계)</option>
               <option value="보고서_서술형">전문 정책 분석 보고서 (서술형, 현황-문제점-대응방안)</option>
               <option value="요약표">경영진 보고용 마크다운 요약표</option>
             </select>
@@ -225,7 +240,7 @@ def get_dashboard_html() -> str:
                       class="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:ring-2 focus:ring-blue-500"></textarea>
           </div>
 
-          <!-- Quick Templates -->
+          <!-- 빠른 템플릿 -->
           <div>
             <span class="text-xs font-medium text-slate-400">빠른 예시 템플릿:</span>
             <div class="flex flex-wrap gap-1.5 mt-1.5">
@@ -244,7 +259,7 @@ def get_dashboard_html() -> str:
           </button>
         </div>
 
-        <!-- Output Preview -->
+        <!-- 출력 미리보기 -->
         <div class="lg:col-span-7 bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex flex-col">
           <div class="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
             <h3 class="font-bold text-slate-900 flex items-center space-x-2">
@@ -267,7 +282,7 @@ def get_dashboard_html() -> str:
             <p class="text-slate-400 italic text-center my-32">좌측에서 기안 제목과 양식을 설정한 후 '공문서 초안 자동 작성'을 누르세요.</p>
           </div>
 
-          <!-- Referenced Sources in Draft -->
+          <!-- 초안에서 참조한 근거 -->
           <div id="draft-sources-container" class="mt-4 pt-3 border-t border-slate-100 hidden">
             <h4 class="text-xs font-bold text-slate-600 mb-2">기안 작성 시 인용된 사내 문서 근거:</h4>
             <div id="draft-sources-list" class="space-y-1.5 text-xs text-slate-600"></div>
@@ -277,11 +292,11 @@ def get_dashboard_html() -> str:
     </section>
 
     <!-- ========================================== -->
-    <!-- TAB 3: STRUCTURED ENTITY EXTRACTION        -->
+    <!-- 탭 3: 구조화 항목 추출 -->
     <!-- ========================================== -->
     <section id="panel-extract" class="hidden space-y-6">
       <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <!-- Settings -->
+        <!-- 설정 영역 -->
         <div class="lg:col-span-5 bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
           <h2 class="text-lg font-bold text-slate-900">정형 데이터 자동 추출</h2>
           <p class="text-sm text-slate-500">비정형 문서에서 행정 처분 내역, 사업 계획, 공문서 메타데이터 등을 정형 JSON으로 구조화합니다.</p>
@@ -314,7 +329,7 @@ def get_dashboard_html() -> str:
           </button>
         </div>
 
-        <!-- Extraction Results -->
+        <!-- 추출 결과 영역 -->
         <div class="lg:col-span-7 bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex flex-col">
           <div class="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
             <h3 class="font-bold text-slate-900 flex items-center space-x-2">
@@ -335,13 +350,13 @@ def get_dashboard_html() -> str:
     </section>
 
     <!-- ========================================== -->
-    <!-- TAB 4: DOCUMENT VAULT & UPLOAD             -->
+    <!-- 탭 4: 문서 보관함과 업로드 -->
     <!-- ========================================== -->
     <section id="panel-vault" class="hidden space-y-6">
-      <!-- Upload Zone -->
+      <!-- 업로드 영역 -->
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
         <h2 class="text-lg font-bold text-slate-900 mb-2">신규 사내 문서 인제스트 (Ingestion)</h2>
-        <p class="text-sm text-slate-500 mb-4">HWPX (한글 표준), PDF, TXT, DOCX, CSV 파일을 업로드하면 텍스트 정제, 텍스트 품질 진단, BAAI/bge-m3 임베딩 후 pgvector에 즉시 보관됩니다.</p>
+        <p class="text-sm text-slate-500 mb-4">HWPX, PDF, TXT, DOCX, CSV 파일을 업로드하면 추출 텍스트를 휴리스틱 진단·임베딩하고 pgvector에 보관합니다. 진단 점수는 공식 적합 판정이 아닙니다.</p>
 
         <div id="dropzone" class="border-2 border-dashed border-slate-300 hover:border-blue-500 rounded-xl p-8 text-center bg-slate-50 hover:bg-blue-50/40 transition cursor-pointer"
              onclick="document.getElementById('file-input').click();">
@@ -355,7 +370,7 @@ def get_dashboard_html() -> str:
         </div>
       </div>
 
-      <!-- Document List Table -->
+      <!-- 문서 목록 표 -->
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
         <div class="flex items-center justify-between mb-4">
           <div>
@@ -391,11 +406,11 @@ def get_dashboard_html() -> str:
     </section>
 
     <!-- ========================================== -->
-    <!-- TAB 5: SYSTEM & n8n INTEGRATION            -->
+    <!-- 탭 5: 시스템과 n8n 연동 -->
     <!-- ========================================== -->
     <section id="panel-system" class="hidden space-y-6">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <!-- System Health Card -->
+        <!-- 시스템 상태 카드 -->
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
           <h2 class="text-lg font-bold text-slate-900">엔진 상태 및 하드웨어 사양</h2>
           
@@ -422,12 +437,12 @@ def get_dashboard_html() -> str:
             </div>
             <div class="flex justify-between items-center py-2">
               <span class="text-slate-500">GPU VRAM 설정 (RTX 5060 Ti)</span>
-              <span class="font-mono font-semibold text-emerald-600">utilization 0.85 (안전치 13GB 제한)</span>
+              <span class="font-mono font-semibold text-emerald-600">기본 utilization 0.75 (설정 상한 약 12 GiB)</span>
             </div>
           </div>
         </div>
 
-        <!-- n8n Integration Guide Card -->
+        <!-- n8n 연동 안내 카드 -->
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-4">
           <h2 class="text-lg font-bold text-slate-900">n8n 자동화 파이프라인 연동 규격</h2>
           <p class="text-sm text-slate-500">사내 포털이나 n8n 워크플로우에서 HTTP Request 노드로 바로 호출할 수 있습니다.</p>
@@ -452,7 +467,7 @@ def get_dashboard_html() -> str:
 
   </main>
 
-  <!-- Chunk Viewer Modal -->
+  <!-- 청크 조회 모달 -->
   <div id="chunk-modal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
     <div class="bg-white rounded-xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl">
       <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
@@ -465,7 +480,7 @@ def get_dashboard_html() -> str:
         </button>
       </div>
       <div class="p-6 overflow-y-auto space-y-4 flex-1" id="modal-chunks-body">
-        <!-- Chunks list -->
+        <!-- 청크 목록 -->
       </div>
       <div class="px-6 py-3 border-t border-slate-200 bg-slate-50 text-right">
         <button onclick="closeChunkModal()" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 text-sm font-medium rounded-lg">닫기</button>
@@ -479,13 +494,57 @@ def get_dashboard_html() -> str:
     </div>
   </footer>
 
-  <!-- Dashboard JavaScript Application -->
+  <!-- 대시보드 JavaScript 애플리케이션 -->
   <script>
     let currentRawDraft = "";
     let currentExtractJson = "";
     let cachedDocuments = [];
 
-    // Tab switcher
+    let ragApiKey = '';
+
+    function saveApiKey() {
+      const input = document.getElementById('api-key-input');
+      const key = input.value.trim();
+      if (key) {
+        ragApiKey = key;
+        input.value = '';
+        document.getElementById('api-key-status').innerText = '키를 이 페이지에 적용했습니다.';
+      } else {
+        clearApiKey();
+        return;
+      }
+      checkHealth();
+      loadDocuments();
+    }
+
+    function clearApiKey() {
+      ragApiKey = '';
+      document.getElementById('api-key-input').value = '';
+      document.getElementById('api-key-status').innerText = '페이지에서 키를 지웠습니다.';
+    }
+
+    async function apiFetch(input, options = {}) {
+      const headers = new Headers(options.headers || {});
+      if (ragApiKey) headers.set('X-API-Key', ragApiKey);
+      const response = await fetch(input, { ...options, headers });
+      if (response.status === 401) {
+        document.getElementById('api-key-status').innerText = 'API 키를 확인하고 다시 저장해 주세요.';
+      }
+      return response;
+    }
+
+    function renderMarkdown(text) {
+      const source = String(text || '');
+      if (window.marked && window.DOMPurify) {
+        return DOMPurify.sanitize(marked.parse(source), {
+          ALLOWED_TAGS: ['a', 'b', 'blockquote', 'br', 'code', 'del', 'div', 'em', 'h1', 'h2', 'h3', 'h4', 'hr', 'i', 'li', 'ol', 'p', 'pre', 'span', 'strong', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul'],
+          ALLOWED_ATTR: ['href', 'title'],
+        });
+      }
+      return `<pre class="whitespace-pre-wrap">${escapeHtml(source)}</pre>`;
+    }
+
+    // 탭 전환 처리함
     function switchTab(tabName) {
       const tabs = ['search', 'draft', 'extract', 'vault', 'system'];
       tabs.forEach(t => {
@@ -507,13 +566,13 @@ def get_dashboard_html() -> str:
       }
     }
 
-    // Suggested query helper
+    // 추천 질의 입력을 보조함
     function setQuery(text) {
       document.getElementById('search-input').value = text;
       executeQuery();
     }
 
-    // Execute RAG Query
+    // RAG 질의를 실행함
     async function executeQuery() {
       const question = document.getElementById('search-input').value.trim();
       if (!question) return;
@@ -528,7 +587,7 @@ def get_dashboard_html() -> str:
 
       const startTime = performance.now();
       try {
-        const res = await fetch('/query', {
+        const res = await apiFetch('/query', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -550,9 +609,9 @@ def get_dashboard_html() -> str:
 
         document.getElementById('search-results-box').classList.remove('hidden');
         document.getElementById('search-elapsed').innerText = `소요 시간: ${elapsed}초 &bull; 검색 모드: ${mode === 'hybrid' ? '하이브리드 RRF' : 'Dense 벡터'}`;
-        document.getElementById('search-answer-content').innerHTML = marked.parse(data.answer || '답변을 생성하지 못했습니다.');
+        document.getElementById('search-answer-content').innerHTML = renderMarkdown(data.answer || '답변을 생성하지 못했습니다.');
 
-        // Render Citations
+        // 인용 근거를 렌더링함
         const sourcesList = document.getElementById('search-sources-list');
         sourcesList.innerHTML = '';
         document.getElementById('search-citation-count').innerText = `총 ${data.sources.length}개 청크 인용`;
@@ -563,7 +622,7 @@ def get_dashboard_html() -> str:
           card.className = "p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1.5";
           card.innerHTML = `
             <div class="flex items-center justify-between">
-              <span class="font-bold text-slate-800">[${src.rank}] ${src.source_name} (청크 #${src.chunk_index})</span>
+              <span class="font-bold text-slate-800">[${src.rank}] ${escapeHtml(src.source_name)} (청크 #${src.chunk_index})</span>
               <div class="flex items-center space-x-2">
                 <span class="px-2 py-0.5 bg-blue-100 text-blue-700 font-semibold rounded">점수 ${scoreDisplay}</span>
                 <span class="px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded">품질 ${src.quality_score || 100}점</span>
@@ -582,14 +641,14 @@ def get_dashboard_html() -> str:
       }
     }
 
-    // Fill Draft Template
+    // 초안 입력 양식을 채움
     function fillDraftTemplate(style, title, instructions) {
       document.getElementById('draft-style').value = style;
       document.getElementById('draft-title').value = title;
       document.getElementById('draft-instructions').value = instructions;
     }
 
-    // Execute Official Drafting
+    // 공식 문서 초안 생성을 실행함
     async function executeDraft() {
       const title = document.getElementById('draft-title').value.trim();
       if (!title) {
@@ -607,7 +666,7 @@ def get_dashboard_html() -> str:
       outputBox.innerHTML = `<div class="text-center my-32"><div class="inline-block animate-spin rounded-full h-8 w-8 border-4 border-indigo-500 border-t-transparent"></div><p class="mt-3 text-slate-500 text-xs">관련 사내 문서를 하이브리드 검색하고 행정 양식에 맞춰 작성 중입니다...</p></div>`;
 
       try {
-        const res = await fetch('/draft', {
+        const res = await apiFetch('/draft', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -625,10 +684,10 @@ def get_dashboard_html() -> str:
 
         const data = await res.json();
         currentRawDraft = data.content;
-        outputBox.innerHTML = marked.parse(data.content);
+        outputBox.innerHTML = renderMarkdown(data.content);
         document.getElementById('draft-result-heading').innerText = `기안 문서: ${data.title} (${data.style})`;
 
-        // Render referenced sources
+        // 참조 근거를 렌더링함
         const sourcesContainer = document.getElementById('draft-sources-container');
         const sourcesList = document.getElementById('draft-sources-list');
         sourcesList.innerHTML = '';
@@ -639,7 +698,7 @@ def get_dashboard_html() -> str:
             item.className = "flex items-center space-x-2";
             item.innerHTML = `
               <span class="w-1.5 h-1.5 bg-indigo-500 rounded-full"></span>
-              <span class="font-medium text-slate-700">${s.source_name} (청크 #${s.chunk_index})</span>
+              <span class="font-medium text-slate-700">${escapeHtml(s.source_name)} (청크 #${s.chunk_index})</span>
             `;
             sourcesList.appendChild(item);
           });
@@ -677,7 +736,7 @@ def get_dashboard_html() -> str:
       URL.revokeObjectURL(url);
     }
 
-    // Execute Entity Extraction
+    // 구조화 항목 추출을 실행함
     async function executeExtract() {
       const schema = document.getElementById('extract-schema').value;
       const docId = document.getElementById('extract-doc-select').value || null;
@@ -696,7 +755,7 @@ def get_dashboard_html() -> str:
       outputBox.innerHTML = `<div class="text-center my-32"><div class="inline-block animate-spin rounded-full h-8 w-8 border-4 border-emerald-500 border-t-transparent"></div><p class="mt-3 text-slate-500 text-xs">vLLM을 통해 비정형 텍스트에서 정형 스키마를 추출하고 있습니다...</p></div>`;
 
       try {
-        const res = await fetch('/documents/extract', {
+        const res = await apiFetch('/documents/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -714,7 +773,7 @@ def get_dashboard_html() -> str:
         const data = await res.json();
         currentExtractJson = JSON.stringify(data.extracted_data, null, 2);
 
-        // Render Cards + JSON
+        // 결과 카드와 JSON을 렌더링함
         let cardHtml = `<div class="space-y-4">`;
         cardHtml += `<div class="flex items-center justify-between"><span class="font-bold text-slate-800">문서: ${escapeHtml(data.source_name)}</span><span class="text-xs bg-emerald-100 text-emerald-800 px-2.5 py-0.5 rounded-full font-semibold">${escapeHtml(data.schema_type)}</span></div>`;
         cardHtml += `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">`;
@@ -749,20 +808,20 @@ def get_dashboard_html() -> str:
       });
     }
 
-    // Load Documents from API
+    // API에서 문서 목록을 불러옴
     async function loadDocuments() {
       try {
-        const res = await fetch('/documents?limit=100');
+        const res = await apiFetch('/documents?limit=100');
         if (!res.ok) return;
         const data = await res.json();
         cachedDocuments = data.items || [];
 
-        // Update Header Stats
+        // 헤더 통계를 갱신함
         document.getElementById('stat-docs').innerText = data.total;
         const totalChunks = cachedDocuments.reduce((acc, cur) => acc + (cur.chunk_count || 0), 0);
         document.getElementById('stat-chunks').innerText = totalChunks;
 
-        // Update Filters in Search and Extract Tabs
+        // 검색·추출 탭의 문서 필터를 갱신함
         const searchDocFilter = document.getElementById('search-doc-filter');
         const extractDocSelect = document.getElementById('extract-doc-select');
         const curSearchVal = searchDocFilter.value;
@@ -779,7 +838,7 @@ def get_dashboard_html() -> str:
         searchDocFilter.value = curSearchVal;
         extractDocSelect.value = curExtractVal;
 
-        // Render Table Body
+        // 문서 표 본문을 렌더링함
         const tbody = document.getElementById('docs-table-body');
         if (cachedDocuments.length === 0) {
           tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">등록된 문서가 없습니다. 상단에서 파일을 업로드해 보세요.</td></tr>`;
@@ -802,8 +861,8 @@ def get_dashboard_html() -> str:
             <td class="px-3 py-3"><span class="px-2 py-0.5 text-xs rounded-full font-semibold ${badgeClass}">${score}점</span></td>
             <td class="px-4 py-3 text-xs text-slate-400">${doc.created_at ? doc.created_at.slice(0, 16).replace('T', ' ') : '-'}</td>
             <td class="px-4 py-3 text-right space-x-1">
-              <button onclick="viewChunks('${doc.id}', '${escapeHtml(doc.source_name)}')" class="px-2 py-1 text-xs text-blue-600 hover:bg-blue-50 rounded">청크 보기</button>
-              <button onclick="deleteDoc('${doc.id}', '${escapeHtml(doc.source_name)}')" class="px-2 py-1 text-xs text-red-600 hover:bg-red-50 rounded">삭제</button>
+              <button type="button" data-action="view-chunks" data-doc-id="${escapeHtml(String(doc.id))}" data-doc-name="${escapeHtml(doc.source_name)}" class="px-2 py-1 text-xs text-blue-600 hover:bg-blue-50 rounded">청크 보기</button>
+              <button type="button" data-action="delete-doc" data-doc-id="${escapeHtml(String(doc.id))}" data-doc-name="${escapeHtml(doc.source_name)}" class="px-2 py-1 text-xs text-red-600 hover:bg-red-50 rounded">삭제</button>
             </td>
           `;
           tbody.appendChild(tr);
@@ -814,7 +873,7 @@ def get_dashboard_html() -> str:
       }
     }
 
-    // View Chunks Modal
+    // 청크 조회 모달을 표시함
     async function viewChunks(docId, docName) {
       document.getElementById('modal-doc-title').innerText = docName;
       document.getElementById('modal-doc-subtitle').innerText = `문서 ID: ${docId}`;
@@ -823,7 +882,7 @@ def get_dashboard_html() -> str:
       document.getElementById('chunk-modal').classList.remove('hidden');
 
       try {
-        const res = await fetch(`/documents/${docId}/chunks`);
+        const res = await apiFetch(`/documents/${docId}/chunks`);
         if (!res.ok) throw new Error('청크 조회 실패');
         const chunks = await res.json();
 
@@ -854,11 +913,11 @@ def get_dashboard_html() -> str:
       document.getElementById('chunk-modal').classList.add('hidden');
     }
 
-    // Delete Document
+    // 문서를 삭제함
     async function deleteDoc(docId, docName) {
       if (!confirm(`'${docName}' 문서를 삭제하시겠습니까? 관련 청크와 벡터가 모두 삭제됩니다.`)) return;
       try {
-        const res = await fetch(`/documents/${docId}`, { method: 'DELETE' });
+        const res = await apiFetch(`/documents/${docId}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('삭제 실패');
         loadDocuments();
       } catch (err) {
@@ -866,7 +925,7 @@ def get_dashboard_html() -> str:
       }
     }
 
-    // File Upload Handler
+    // 파일 업로드를 처리함
     async function handleFileUpload(event) {
       const file = event.target.files[0];
       if (!file) return;
@@ -881,7 +940,7 @@ def get_dashboard_html() -> str:
       formData.append('metadata', JSON.stringify({ uploaded_by: 'poc_dashboard' }));
 
       try {
-        const res = await fetch('/documents/file', {
+        const res = await apiFetch('/documents/file', {
           method: 'POST',
           body: formData
         });
@@ -903,10 +962,10 @@ def get_dashboard_html() -> str:
       }
     }
 
-    // Load System Stats & Health
+    // 시스템 통계와 상태를 불러옴
     async function loadStats() {
       try {
-        const res = await fetch('/stats');
+        const res = await apiFetch('/stats');
         if (res.ok) {
           const data = await res.json();
           document.getElementById('sys-vllm-model').innerText = data.llm_model || 'rag-vllm-model';
@@ -917,10 +976,10 @@ def get_dashboard_html() -> str:
       }
     }
 
-    // Check health on boot
+    // 시작 시 서비스 상태를 확인함
     async function checkHealth() {
       try {
-        const res = await fetch('/health');
+        const res = await apiFetch('/health');
         if (res.ok) {
           const data = await res.json();
           if (data.status === 'ok') {
@@ -947,8 +1006,15 @@ def get_dashboard_html() -> str:
         .replace(/'/g, '&#039;');
     }
 
-    // Init on page load
+    // 페이지 로드 시 초기화함
     window.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('docs-table-body').addEventListener('click', event => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const { action, docId, docName } = button.dataset;
+        if (action === 'view-chunks') viewChunks(docId, docName);
+        if (action === 'delete-doc') deleteDoc(docId, docName);
+      });
       checkHealth();
       loadDocuments();
     });

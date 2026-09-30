@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Export verified RAG Q&A and official drafts into fine-tuning (SFT/LoRA) datasets."""
+# =============================================================================
+# 파일명: export_training_data.py
+# 경로: scripts/export_training_data.py
+# 목적: 검증된 RAG 질의응답과 초안을 SFT·LoRA 학습 데이터로 내보냄
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
+
+"""검증된 RAG 질의응답과 초안을 SFT·LoRA 학습 데이터로 내보냄"""
 
 from __future__ import annotations
 
@@ -7,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-# Add project root to sys.path
+# NOTE: 패키지를 별도로 설치하지 않고도 저장소의 src 코드를 실행하도록 import 경로를 추가함
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from rag_vllm.config import get_settings
@@ -16,6 +25,12 @@ from rag_vllm.service import OFFICIAL_STYLE_PROMPTS
 
 
 def export_datasets() -> None:
+    """최근 저장 문서에서 Alpaca·ShareGPT 학습 데이터셋을 생성함
+
+    Caveats:
+        생성 파일은 원문 일부를 포함할 수 있으므로 공개 저장소나 외부 학습 서비스로
+        전송하기 전에 데이터 분류와 개인정보 검토가 필요함
+    """
     settings = get_settings()
     out_dir = Path(__file__).resolve().parent.parent / "data" / "sft"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -25,7 +40,7 @@ def export_datasets() -> None:
 
     connection = _connect(settings)
     try:
-        # 1. Export documents as summarization and extraction training examples
+        # NOTE: 최근 문서 일부만 사용해 반복 실행 가능한 샘플 학습 세트를 구성함
         docs = connection.execute(
             "SELECT id, source_name, content, metadata FROM rag_documents ORDER BY created_at DESC LIMIT 50"
         ).fetchall()
@@ -34,14 +49,14 @@ def export_datasets() -> None:
             content = doc["content"]
             name = doc["source_name"]
 
-            # Task A: Official Administrative Drafting SFT Example
+            # NOTE: 공공기관 개조식 초안 형식의 지도 미세조정 예시를 생성함
             alpaca_records.append({
                 "instruction": "제공된 행정 참고 자료를 바탕으로 대한민국 공공기관 공문서 표준 개조식 양식에 맞추어 공식 문서를 작성하십시오.",
                 "input": f"[참고 자료: {name}]\n{content[:2000]}",
                 "output": f"제목: {name} 관련 시행 계획 보고\n\n1. 추진 배경 및 근거\n가. 관련 법령 및 기본 운영 규정에 의거함.\n\n2. 주요 내용\n가. 세부 운영 지침 준수 철저.",
             })
 
-            # Task B: ShareGPT format
+            # NOTE: 동일 근거를 대화형 ShareGPT 입력 구조로 변환함
             sharegpt_records.append({
                 "conversations": [
                     {
@@ -59,12 +74,12 @@ def export_datasets() -> None:
                 ]
             })
 
-        # Write Alpaca format
+        # NOTE: Alpaca JSON 배열은 일반 SFT 도구와의 호환을 위해 별도 저장함
         alpaca_path = out_dir / "alpaca_sft_dataset.json"
         alpaca_path.write_text(json.dumps(alpaca_records, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"✅ Alpaca 포맷 학습 데이터셋 저장: {alpaca_path} (총 {len(alpaca_records)}건)")
 
-        # Write ShareGPT format
+        # NOTE: ShareGPT JSONL은 대화 예시를 한 줄 단위로 처리할 수 있도록 저장함
         sharegpt_path = out_dir / "sharegpt_sft_dataset.jsonl"
         with sharegpt_path.open("w", encoding="utf-8") as f:
             for r in sharegpt_records:

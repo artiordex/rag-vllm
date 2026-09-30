@@ -1,4 +1,13 @@
-"""Comprehensive test suite for rag-vllm."""
+# =============================================================================
+# 파일명: test_rag_vllm.py
+# 경로: tests/test_rag_vllm.py
+# 목적: 파서·품질진단·검색·보안·멀티모달 API의 통합 동작 검증함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
+
+"""파서·품질진단·검색·보안·멀티모달 API의 통합 동작 검증함"""
 
 import io
 import zipfile
@@ -12,7 +21,7 @@ client = TestClient(app)
 
 
 def test_hwpx_parsing():
-    """Verify that HWPX files with sections and tables extract correctly."""
+    """섹션과 표를 포함한 HWPX에서 행정 텍스트와 표를 추출하는지 검증함"""
     section_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
         xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
@@ -43,21 +52,21 @@ def test_hwpx_parsing():
 
 
 def test_quality_diagnostics():
-    """Test text quality diagnostics for valid and short text."""
-    # 1. Normal clean text
+    """정상 본문과 짧은 본문에 대한 품질 진단 결과를 검증함"""
+    # NOTE: 충분한 본문은 통과 상태와 높은 점수를 확인함
     clean_text = "이것은 충분한 길이의 행정 문서 테스트 텍스트입니다. " * 10
     result = diagnose_text(clean_text, "test.txt")
     assert result["score"] >= 80
     assert result["status"] == "pass"
 
-    # 2. Too short text
+    # NOTE: 짧은 본문은 길이 부족 이슈를 포함하는지 확인함
     short_text = "너무 짧음"
     result_short = diagnose_text(short_text, "short.txt")
     assert any(i["code"] == "SHORT_DOCUMENT" for i in result_short["issues"])
 
 
 def test_api_health_and_stats():
-    """Test /health and /stats endpoints."""
+    """`/health`와 `/stats` 엔드포인트의 기본 응답을 검증함"""
     res_health = client.get("/health")
     assert res_health.status_code == 200
     data_health = res_health.json()
@@ -73,7 +82,7 @@ def test_api_health_and_stats():
 
 
 def test_api_dashboard_html():
-    """Test GET and HEAD on root dashboard endpoint."""
+    """루트 대시보드 엔드포인트의 GET·HEAD 응답을 검증함"""
     res_get = client.get("/")
     assert res_get.status_code == 200
     assert "text/html" in res_get.headers["content-type"]
@@ -84,7 +93,7 @@ def test_api_dashboard_html():
 
 
 def test_api_list_documents():
-    """Test listing documents."""
+    """문서 목록 엔드포인트가 목록과 전체 건수를 반환하는지 검증함"""
     res = client.get("/documents")
     assert res.status_code == 200
     data = res.json()
@@ -94,7 +103,7 @@ def test_api_list_documents():
 
 
 def test_api_structured_extract():
-    """Test structured entity extraction endpoint."""
+    """구조화 항목 추출 엔드포인트의 스키마 응답을 검증함"""
     sample_text = (
         "문서번호: 과기정통부-2026-99호\n"
         "시행일자: 2026-05-01\n"
@@ -115,14 +124,14 @@ def test_api_structured_extract():
 
 
 def test_api_hybrid_query():
-    """Test hybrid RRF search query."""
+    """하이브리드 RRF 검색 질의와 신뢰도 필드를 검증함"""
     res = client.post(
         "/query",
         json={
             "question": "행정처분 과태료 기준은?",
             "search_mode": "hybrid",
             "top_k": 3,
-            "use_llm": False,  # vector + sparse search retrieval only
+            "use_llm": False,  # NOTE: LLM을 호출하지 않고 dense·sparse 검색만 검증함
         },
     )
     assert res.status_code == 200
@@ -134,7 +143,7 @@ def test_api_hybrid_query():
 
 
 def test_enterprise_standardization_and_pii():
-    """Test Korean PII detection, masking, and terminology standardization."""
+    """한국어 개인정보 탐지·마스킹과 행정 용어 표준화 후보를 검증함"""
     from rag_vllm.standardization import evaluate_enterprise_quality
 
     text = "담당자 홍길동 (주민번호: 900101-1234567, 휴대폰: 010-9876-5432). 과태금과 주소록 확인 바람."
@@ -147,10 +156,10 @@ def test_enterprise_standardization_and_pii():
 
 
 def test_multimodal_image_parsing():
-    """Test image parsing and visual metadata extraction."""
+    """이미지 파싱과 시각 메타데이터 추출을 검증함"""
     from PIL import Image
 
-    # Create dummy in-memory PNG
+    # NOTE: 외부 파일 없이 이미지 파싱 경로를 검증하도록 메모리에서 PNG를 생성함
     img = Image.new("RGB", (120, 80), color="blue")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -163,7 +172,7 @@ def test_multimodal_image_parsing():
 
 
 def test_reranker_cross_scoring():
-    """Test 2-stage reranker cross-scoring heuristic and sorting."""
+    """2단계 리랭커의 교차 점수 휴리스틱과 정렬을 검증함"""
     from rag_vllm.reranker import rerank_chunks
 
     query = "식품위생 행정처분 기준"
@@ -177,7 +186,7 @@ def test_reranker_cross_scoring():
 
 
 def test_api_enterprise_quality_endpoint():
-    """Test POST /quality/enterprise endpoint."""
+    """`POST /quality/enterprise` 엔드포인트의 기업형 품질 응답을 검증함"""
     res = client.post(
         "/quality/enterprise",
         json={
@@ -194,7 +203,7 @@ def test_api_enterprise_quality_endpoint():
 
 
 def test_api_structured_quality_endpoint():
-    """Test POST /quality/structured endpoint."""
+    """`POST /quality/structured` 엔드포인트의 CSV 구조 품질 응답을 검증함"""
     csv_sample = (
         "id,name,phone,join_date\n"
         "1,홍길동,010-1234-5678,2026-01-01\n"
@@ -214,10 +223,8 @@ def test_api_structured_quality_endpoint():
 
 
 def test_api_audit_logs_endpoint():
-    """Test GET /audit/logs endpoint."""
+    """`GET /audit/logs` 엔드포인트가 감사 로그 목록을 반환하는지 검증함"""
     res = client.get("/audit/logs?limit=10")
     assert res.status_code == 200
     logs = res.json()
     assert isinstance(logs, list)
-
-

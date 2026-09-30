@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""인박스 폴더(data/inbox) 자동 감시 및 RAG 적재 스크립트.
+# =============================================================================
+# 파일명: watch_inbox.py
+# 경로: scripts/watch_inbox.py
+# 목적: 인박스 문서를 감지해 RAG API로 전송하고 처리 폴더로 이동함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
 
-폴더에 HWPX, PDF, DOCX, JSON 파일이 들어오면 자동으로 rag-vllm API로 전송하고
-성공 시 data/processed 폴더로 이동합니다.
+"""인박스 폴더(data/inbox)를 감시해 RAG에 적재하는 스크립트임
+
+HWPX·PDF·DOCX·JSON 파일을 rag-vllm API로 전송하고 성공한 파일을
+data/processed 폴더로 이동함
 """
 
 from __future__ import annotations
@@ -22,6 +31,17 @@ SUPPORTED_EXTS = {".pdf", ".hwpx", ".docx", ".json", ".html", ".txt"}
 
 
 def process_file(file_path: Path) -> bool:
+    """지원 파일을 RAG API에 업로드하고 성공한 파일을 처리 폴더로 이동함
+
+    Args:
+        file_path: 인박스에서 처리할 파일 경로임
+
+    Returns:
+        bool: 업로드와 이동을 모두 완료했으면 `True`임
+
+    Caveats:
+        API 호출 실패 파일은 인박스에 남겨 다음 감시 주기에 재시도함
+    """
     if file_path.suffix.lower() not in SUPPORTED_EXTS:
         return False
 
@@ -48,6 +68,7 @@ def process_file(file_path: Path) -> bool:
 
 
 def main() -> None:
+    """인박스 폴더를 주기적으로 확인하는 워커를 실행함"""
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 60)

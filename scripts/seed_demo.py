@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Seed sample public/administrative documents into rag-vllm for live POC demonstration."""
+# =============================================================================
+# 파일명: seed_demo.py
+# 경로: scripts/seed_demo.py
+# 목적: 내부 POC 검증용 공개·행정 샘플 문서를 생성하고 RAG에 적재함
+# 작성자: AI전략팀
+# 작성일: 2026-09-30
+# 수정일: 2026-09-30
+# =============================================================================
+
+"""내부 POC 검증용 공개·행정 샘플 문서를 생성하고 RAG에 적재함"""
 
 from __future__ import annotations
 
@@ -8,7 +17,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-# Add project root to sys.path
+# NOTE: 패키지를 별도로 설치하지 않고도 저장소의 src 코드를 실행하도록 import 경로를 추가함
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from rag_vllm.config import get_settings
@@ -17,7 +26,14 @@ from rag_vllm.service import ingest_text
 
 
 def create_sample_hwpx() -> bytes:
-    """Create a realistic in-memory Korean HWPX administrative document."""
+    """실제 행정 문서와 유사한 HWPX 샘플을 메모리에서 생성함
+
+    Returns:
+        bytes: 압축된 HWPX 컨테이너 바이트임
+
+    Caveats:
+        파일 시스템에 먼저 저장하지 않아 파서의 입력·압축 해제 경로를 독립적으로 검증함
+    """
     section_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
         xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
@@ -143,13 +159,14 @@ AI가 기안한 공문서 초안이나 보고서는 최종 발송 또는 결재 
 
 
 def main() -> None:
+    """행정·교육·보안 샘플 문서를 생성해 RAG 저장소에 적재함"""
     settings = get_settings()
     data_dir = Path(__file__).resolve().parent.parent / "data" / "samples"
     data_dir.mkdir(parents=True, exist_ok=True)
 
     print("=== [RAG-vLLM 사내 POC 샘플 문서 시딩 시작] ===")
 
-    # 1. HWPX Notice
+    # NOTE: 표와 행정처분 근거가 포함된 HWPX 파싱·인제스트 경로를 확인함
     hwpx_path = data_dir / "식품의약품안전처_식품위생_처분고시_제2026-14호.hwpx"
     hwpx_bytes = create_sample_hwpx()
     hwpx_path.write_bytes(hwpx_bytes)
@@ -166,7 +183,7 @@ def main() -> None:
     )
     print(f"   -> 인제스트 성공! Document ID: {res1['document_id']}, 청크: {res1['chunk_count']}개, 품질: {res1['quality']['score']}점")
 
-    # 2. Education Plan TXT
+    # NOTE: 수치·일정·품질 지표가 포함된 일반 텍스트 문서를 적재함
     edu_path = data_dir / "교육부_2026년도_공공데이터_품질관리_지침_및_실태평가_계획서.txt"
     edu_path.write_text(SAMPLE_EDUCATION_TXT, encoding="utf-8")
     print(f"2. 텍스트 문서 생성 완료: {edu_path.name}")
@@ -181,7 +198,7 @@ def main() -> None:
     )
     print(f"   -> 인제스트 성공! Document ID: {res2['document_id']}, 청크: {res2['chunk_count']}개, 품질: {res2['quality']['score']}점")
 
-    # 3. Security Guidelines TXT
+    # NOTE: 온프레미스·개인정보·감사 요구사항이 포함된 보안 지침을 적재함
     sec_path = data_dir / "과기정통부_생성형AI_공공업무_도입_및_보안_가이드라인.txt"
     sec_path.write_text(SAMPLE_SECURITY_GUIDELINE_TXT, encoding="utf-8")
     print(f"3. 텍스트 문서 생성 완료: {sec_path.name}")
