@@ -7,21 +7,12 @@ official standard dictionary, a compliance score, or an approval decision.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Any
 
-
-@dataclass(frozen=True, slots=True)
-class PIIMatch:
-    category: str
-    original: str
-    masked: str
-    start: int
-    end: int
-
+from .chunking import MAX_TEXT_CHARACTERS
 
 # =====================================================================
-# 1. PII Regex Patterns (대한민국 개인정보보호법 핵심 식별자)
+# 1. Heuristic patterns for common Korean identifiers and contact fields
 # =====================================================================
 
 PII_PATTERNS = {
@@ -68,26 +59,31 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
         # 계좌번호 패턴은 기관별 형식이 달라 heuristic mask로만 다룬다.
         return f"{groups[0]}-****-**{groups[2][-2:]}"
 
-    matches: list[tuple[int, int, str, str, str]] = []
-    occupied: list[tuple[int, int]] = []
-    for category in priorities:
+    candidates: list[tuple[int, int, int, str, str]] = []
+    for priority, category in enumerate(priorities):
         for match in PII_PATTERNS[category].finditer(text):
             start, end = match.span()
-            if any(start < used_end and end > used_start for used_start, used_end in occupied):
-                continue
-            occupied.append((start, end))
-            matches.append((start, end, category, match.group(0), masked_value(category, match)))
+            replacement = masked_value(category, match) if mask else ""
+            candidates.append((start, end, priority, category, replacement))
 
-    matches.sort(key=lambda item: item[0])
+    candidates.sort(key=lambda item: (item[0], item[2], -(item[1] - item[0])))
+    matches: list[tuple[int, int, str, str]] = []
+    last_end = -1
+    for start, end, _priority, category, replacement in candidates:
+        if start < last_end:
+            continue
+        matches.append((start, end, category, replacement))
+        last_end = end
+
     detected = [
-        {"category": category, "snippet": replacement, "position": start, "end": end}
-        for start, end, category, _original, replacement in matches
+        {"category": category, "position": start, "end": end}
+        for start, end, category, _replacement in matches
     ]
     if not mask:
         return text, detected
 
     masked_text = text
-    for start, end, _category, _original, replacement in reversed(matches):
+    for start, end, _category, replacement in reversed(matches):
         masked_text = masked_text[:start] + replacement + masked_text[end:]
     return masked_text, detected
 
@@ -97,7 +93,7 @@ def detect_and_mask_pii(text: str, mask: bool = True) -> tuple[str, list[dict[st
 # =====================================================================
 
 ADMINISTRATIVE_SYNONYMS = {
-    # 비표준어/일상어: 행정 표준어
+    # Illustrative local replacements; not authoritative dictionary entries.
     "주소록": "연락처목록",
     "과태금": "과태료",
     "주민번호": "주민등록번호",
@@ -155,9 +151,12 @@ def evaluate_enterprise_quality(
     1. 완전성 (Completeness): 누락 및 빈 줄 비율
     2. 유효성 (Validity): 날짜 형식 및 제어문자 오염도
     3. 일관성 (Consistency): 중복 문단 비율
-    4. 무결성 (Integrity): 개인정보 보호 및 비식별화 준수율
+    4. 개인정보 후보 신호: 규칙 기반 문자열 탐지와 선택적 마스킹 시도
     5. 정확성 (Accuracy): 비정상 인코딩 및 기호 깨짐 여부
     """
+    if len(text) > MAX_TEXT_CHARACTERS:
+        raise ValueError(f"진단 텍스트가 허용 한도({MAX_TEXT_CHARACTERS}자)를 초과했습니다.")
+
     # Step 1: PII Scan
     masked_text, pii_issues = detect_and_mask_pii(text, mask=auto_mask_pii)
 
@@ -217,16 +216,19 @@ def evaluate_enterprise_quality(
     if replacement_count > 0:
         score_accuracy -= min(15, replacement_count * 3)
 
-    total_score = max(0, min(100, score_completeness + score_validity + score_consistency + score_integrity + score_accuracy))
+    total_score = 0 if char_count == 0 else max(
+        0,
+        min(100, score_completeness + score_validity + score_consistency + score_integrity + score_accuracy),
+    )
 
     if total_score >= 90:
-        grade = "1등급 (우수)"
+        grade = "로컬 1단계 (참고)"
         status = "pass"
     elif total_score >= 70:
-        grade = "2등급 (보통)"
+        grade = "로컬 2단계 (참고)"
         status = "warn"
     else:
-        grade = "3등급 (미흡/개선필요)"
+        grade = "로컬 3단계 (참고)"
         status = "fail"
 
     recommendations: list[str] = []
@@ -254,6 +256,7 @@ def evaluate_enterprise_quality(
     return {
         "score": total_score,
         "assessment_scope": "rag-vllm-local-heuristic-not-official",
+        "rule_set_version": "enterprise-local-v1",
         "grade": grade,
         "status": status,
         "pillars": {
@@ -265,13 +268,17 @@ def evaluate_enterprise_quality(
         },
         "pii_detected_count": len(pii_issues),
         "pii_details": pii_issues,
-        "standardized_terms_count": len(term_replacements),
+        "standardized_terms_count": sum(term_replacements.values()),
         "standardized_terms": term_replacements,
-        "standardization_status": "local_candidates_pending_review",
+        "standardization_status": (
+            "local_replacements_applied_unverified"
+            if apply_local_term_replacements and term_replacements
+            else "local_candidates_pending_review"
+        ),
         "standardization_source": "rag-vllm_builtin_synonyms",
-        "standardization_applied": apply_local_term_replacements,
+        "standardization_applied": bool(apply_local_term_replacements and term_replacements),
         "pii_scan_scope": "heuristic_pattern_match",
-        "pii_masking_applied": auto_mask_pii,
+        "pii_masking_applied": bool(auto_mask_pii and pii_issues),
         "recommendations": recommendations,
         "cleaned_text": clean_text,
     }
