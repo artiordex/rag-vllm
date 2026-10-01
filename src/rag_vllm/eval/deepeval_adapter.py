@@ -63,7 +63,7 @@ class LocalVLLMDeepEvalAdapter(DeepEvalBaseLLM):
             return response.choices[0].message.content or ""
         except Exception as exc:
             logger.error("로컬 vLLM DeepEval 동기 생성 실패: %s", exc)
-            return f"Error: {exc}"
+            raise
 
     async def a_generate(self, prompt: str, schema: Any = None, *args: Any, **kwargs: Any) -> str:
         """비동기 방식으로 로컬 vLLM에 평가 프롬프트를 전송하고 응답 텍스트를 반환함"""
@@ -76,7 +76,7 @@ class LocalVLLMDeepEvalAdapter(DeepEvalBaseLLM):
             return response.choices[0].message.content or ""
         except Exception as exc:
             logger.error("로컬 vLLM DeepEval 비동기 생성 실패: %s", exc)
-            return f"Error: {exc}"
+            raise
 
     def get_model_name(self, *args: Any, **kwargs: Any) -> str:
         """평가 대상 로컬 모델명을 반환함"""

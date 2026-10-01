@@ -42,9 +42,10 @@ class BaseVectorStore(ABC):
         quality_report: dict[str, Any],
         chunks: list[dict[str, Any]],
         embeddings: list[list[float]],
+        document_id: UUID | None = None,
         replace_existing_source: bool = False,
     ) -> tuple[UUID, bool, int]:
-        """원천 문서 및 청크 임베딩을 저장함"""
+        """원천 문서와 청크 임베딩을 저장하며 필요하면 공유 문서 ID를 사용함"""
         pass
 
     @abstractmethod
@@ -54,6 +55,7 @@ class BaseVectorStore(ABC):
         query_vector: list[float],
         top_k: int = 5,
         document_id: UUID | None = None,
+        document_ids: list[UUID] | None = None,
         min_quality_score: int | None = None,
         project_name: str | None = None,
         department: str | None = None,
@@ -70,6 +72,7 @@ class BaseVectorStore(ABC):
         query_text: str,
         top_k: int = 5,
         document_id: UUID | None = None,
+        document_ids: list[UUID] | None = None,
         min_quality_score: int | None = None,
         project_name: str | None = None,
         department: str | None = None,

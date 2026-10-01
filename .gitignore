@@ -19,3 +19,4 @@ wheels/
 .cache/
 models/
 data/lmops_traces.jsonl
+data/eval/release_report.md

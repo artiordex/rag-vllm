@@ -56,6 +56,7 @@ class PgVectorStore(BaseVectorStore):
         quality_report: dict[str, Any],
         chunks: list[dict[str, Any]],
         embeddings: list[list[float]],
+        document_id: UUID | None = None,
         replace_existing_source: bool = False,
     ) -> tuple[UUID, bool, int]:
         """원천 문서 메타데이터 및 청크 벡터를 PostgreSQL에 저장함"""
@@ -70,6 +71,7 @@ class PgVectorStore(BaseVectorStore):
             quality_report=quality_report,
             chunks=chunks,
             embeddings=embeddings,
+            document_id=document_id,
             replace_existing_source=replace_existing_source,
         )
 
@@ -79,6 +81,7 @@ class PgVectorStore(BaseVectorStore):
         query_vector: list[float],
         top_k: int = 5,
         document_id: UUID | None = None,
+        document_ids: list[UUID] | None = None,
         min_quality_score: int | None = None,
         project_name: str | None = None,
         department: str | None = None,
@@ -90,6 +93,7 @@ class PgVectorStore(BaseVectorStore):
             query_vector,
             top_k=top_k,
             document_id=document_id,
+            document_ids=document_ids,
             min_quality_score=min_quality_score,
             project_name=project_name,
             department=department,
@@ -103,6 +107,7 @@ class PgVectorStore(BaseVectorStore):
         query_text: str,
         top_k: int = 5,
         document_id: UUID | None = None,
+        document_ids: list[UUID] | None = None,
         min_quality_score: int | None = None,
         project_name: str | None = None,
         department: str | None = None,
@@ -115,6 +120,7 @@ class PgVectorStore(BaseVectorStore):
             query_text,
             top_k=top_k,
             document_id=document_id,
+            document_ids=document_ids,
             min_quality_score=min_quality_score,
             project_name=project_name,
             department=department,

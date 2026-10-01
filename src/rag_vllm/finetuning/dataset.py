@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -95,23 +96,38 @@ def tokenize_sft_sample(
         return_tensors=None,
     )
     input_ids = encoded["input_ids"]
-    labels = list(input_ids)
+    labels = [-100] * len(input_ids)
+    target_ranges: list[tuple[int, int]] = []
 
-    # 응답 시작 태그 위치 탐색하여 이전 지침 토큰 레이블을 -100으로 마스킹함
-    # ChatML: <|im_start|>assistant\n
-    # Alpaca: ### 응답:\n
-    sep_candidates = ["<|im_start|>assistant\n", "### 응답:\n"]
-    split_pos = -1
-    for sep in sep_candidates:
-        if sep in prompt_text:
-            prompt_before_resp = prompt_text.split(sep)[0] + sep
-            prefix_ids = tokenizer(prompt_before_resp, add_special_tokens=False)["input_ids"]
-            split_pos = len(prefix_ids)
-            break
+    # 대화형 ChatML은 모든 assistant 턴만 loss 대상으로 삼고 system/user 턴은 제외함.
+    for match in re.finditer(
+        r"<\|im_start\|>assistant\n(.*?)(<\|im_end\|>|$)",
+        prompt_text,
+        flags=re.DOTALL,
+    ):
+        prefix = tokenizer(prompt_text[: match.start(1)], add_special_tokens=True)["input_ids"]
+        target_end = tokenizer(prompt_text[: match.end(2)], add_special_tokens=True)["input_ids"]
+        target_ranges.append((len(prefix), len(target_end)))
 
-    if split_pos > 0 and split_pos < len(labels):
-        for i in range(split_pos):
-            labels[i] = -100
+    # Alpaca 형식은 응답 구분자 뒤부터 토큰화된 끝까지 학습함.
+    if not target_ranges:
+        separator = "### 응답:\n"
+        separator_index = prompt_text.find(separator)
+        if separator_index >= 0:
+            prefix = tokenizer(
+                prompt_text[: separator_index + len(separator)],
+                add_special_tokens=True,
+            )["input_ids"]
+            target_ranges.append((len(prefix), len(input_ids)))
+
+    if not target_ranges:
+        raise ValueError("SFT 샘플에서 assistant 응답 구간을 찾지 못했습니다.")
+
+    for start, end in target_ranges:
+        for index in range(max(0, start), min(len(input_ids), end)):
+            labels[index] = input_ids[index]
+    if all(label == -100 for label in labels):
+        raise ValueError("SFT 샘플의 응답이 max_length에서 잘려 학습 대상 토큰이 없습니다.")
 
     encoded["labels"] = labels
     return encoded

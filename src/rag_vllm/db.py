@@ -328,6 +328,7 @@ def save_document(
     quality_report: dict[str, Any],
     chunks: list[dict[str, Any]],
     embeddings: list[list[float]],
+    document_id: UUID | None = None,
     replace_existing_source: bool = False,
 ) -> tuple[UUID, bool, int]:
     """문서와 모든 청크·임베딩을 하나의 트랜잭션으로 저장함
@@ -343,6 +344,7 @@ def save_document(
         quality_report: 저장 시점의 품질 리포트임
         chunks: 청크 본문과 원문 위치 메타데이터 목록임
         embeddings: 청크별 정규화 임베딩 목록임
+        document_id: 선택 저장소와 ID를 맞출 때 사용하는 문서 ID이며, 생략 시 새 ID를 생성함
         replace_existing_source: 같은 source name의 이전 문서를 교체할지 여부임
 
     Returns:
@@ -379,7 +381,7 @@ def save_document(
                     (source_name,),
                 )
 
-            document_id = uuid4()
+            document_id = document_id or uuid4()
             connection.execute(
                 """
                 INSERT INTO rag_documents

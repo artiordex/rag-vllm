@@ -120,7 +120,7 @@ def _service_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=415, detail=str(exc))
     if isinstance(exc, ValueError):
         return HTTPException(status_code=422, detail=str(exc))
-    if isinstance(exc, (DatabaseError, EmbeddingError, LLMError)):
+    if isinstance(exc, (DatabaseError, EmbeddingError, LLMError, ConnectionError)):
         return HTTPException(status_code=503, detail=str(exc))
     logger.exception("rag-vllm request failed")
     return HTTPException(status_code=500, detail="요청을 처리하지 못했습니다.")
@@ -391,8 +391,17 @@ def query_stream_endpoint(request: QueryRequest, http_request: Request) -> Strea
             question=request.question,
             options=request.to_options(client_ip),
         )
+
+        def stream_with_error_events():
+            try:
+                yield from stream_generator
+            except Exception:
+                logger.exception("rag-vllm streaming request failed")
+                yield f"data: {json.dumps({'type': 'error', 'message': '질의를 처리하지 못했습니다.'}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
         return StreamingResponse(
-            stream_generator,
+            stream_with_error_events(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -638,17 +647,38 @@ def eval_rag_endpoint(request: RagEvalRequest) -> RagEvalResponse:
                 base_url=settings.eval_judge_base_url,
                 model_name=settings.eval_judge_model,
             )
-            faithfulness = deepeval_metrics.get("faithfulness", {}).get("score") or 0.8
-            answer_rel = deepeval_metrics.get("answer_relevancy", {}).get("score") or 0.8
+            faithfulness = deepeval_metrics.get("faithfulness", {}).get("score")
+            answer_rel = deepeval_metrics.get("answer_relevancy", {}).get("score")
+            if faithfulness is None or answer_rel is None:
+                failed = [
+                    name
+                    for name, score in (
+                        ("faithfulness", faithfulness),
+                        ("answer_relevancy", answer_rel),
+                    )
+                    if score is None
+                ]
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"DeepEval 지표 계산에 실패했습니다: {', '.join(failed)}",
+                )
+            local_details = LocalRagEvaluator().evaluate_sample(
+                query=request.query,
+                answer=request.answer,
+                contexts=request.contexts,
+                ground_truth=request.ground_truth,
+            )
             overall = round((faithfulness + answer_rel) * 50.0, 1)
             return RagEvalResponse(
                 query=request.query,
                 answer=request.answer,
                 faithfulness=float(faithfulness),
                 answer_relevance=float(answer_rel),
-                context_precision=1.0,
-                context_recall=None,
-                hallucination_risk="low" if faithfulness >= 0.7 else "high",
+                context_precision=local_details.context_precision,
+                context_recall=local_details.context_recall,
+                hallucination_risk=(
+                    "low" if faithfulness >= 0.75 else "medium" if faithfulness >= 0.45 else "high"
+                ),
                 overall_score=overall,
                 details=deepeval_metrics,
             )

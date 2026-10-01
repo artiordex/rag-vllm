@@ -123,14 +123,7 @@ def ingest_text(
 
     content_hash = _content_hash(normalized)
     existing = find_document_by_hash(settings, name, content_hash)
-    quality = evaluate_enterprise_quality(
-        text,
-        name,
-        auto_mask_pii=settings.ingest_auto_mask_pii,
-        apply_local_term_replacements=settings.ingest_apply_local_term_replacements,
-    )
-    quality = _safe_quality_report(quality)
-    if existing:
+    if existing and settings.vector_store_type == "pgvector":
         return {
             "document_id": existing["id"],
             "name": existing["source_name"],
@@ -138,6 +131,13 @@ def ingest_text(
             "duplicate": True,
             "quality": _safe_quality_report(existing["quality_report"]),
         }
+    quality = evaluate_enterprise_quality(
+        text,
+        name,
+        auto_mask_pii=settings.ingest_auto_mask_pii,
+        apply_local_term_replacements=settings.ingest_apply_local_term_replacements,
+    )
+    quality = _safe_quality_report(quality)
 
     text_chunks = chunk_text(normalized, settings.chunk_size, settings.chunk_overlap)
     if not text_chunks:
@@ -151,6 +151,8 @@ def ingest_text(
         }
         for chunk in text_chunks
     ]
+    # 외부 색인이 선택되면 긴 임베딩 작업 전에 연결 상태를 확인함.
+    vector_store = get_vector_store(settings) if settings.vector_store_type != "pgvector" else None
     embeddings = get_embedder(settings).embed_documents([chunk["text"] for chunk in chunks])
     processing_metadata = {
         "pipeline_version": "rag-vllm-ingestion-v2",
@@ -177,6 +179,8 @@ def ingest_text(
         "official_standardization_verified": False,
     }
     persisted_metadata = {**metadata, "rag_vllm_processing": processing_metadata}
+    # 원본 메타데이터와 문서 조회는 PostgreSQL에 유지하고, 선택된 외부 벡터 DB에도
+    # 같은 문서 ID로 색인함.
     document_id, duplicate, chunk_count = save_document(
         settings,
         source_name=name,
@@ -190,6 +194,20 @@ def ingest_text(
         embeddings=embeddings,
         replace_existing_source=replace_existing_source,
     )
+    if vector_store is not None:
+        vector_store.save_document(
+            source_name=name,
+            source_type=source_type,
+            mime_type=mime_type,
+            content_hash=content_hash,
+            content=normalized,
+            metadata=persisted_metadata,
+            quality_report=quality,
+            chunks=chunks,
+            embeddings=embeddings,
+            document_id=document_id,
+            replace_existing_source=replace_existing_source,
+        )
     clear_semantic_cache()
     return {
         "document_id": document_id,
@@ -289,6 +307,84 @@ def _save_semantic_cache(
                 timestamp=time.time(),
             )
         )
+
+
+def _retrieve_candidates(
+    settings: Settings,
+    *,
+    vector_store_type: str,
+    query_embedding: list[float],
+    query_text: str,
+    top_k: int,
+    document_id: UUID | None,
+    document_ids: list[UUID] | None = None,
+    min_quality_score: int | None,
+    project_name: str | None,
+    department: str | None,
+    max_security_level: int | None,
+    search_mode: str,
+) -> list[dict[str, Any]]:
+    """선택된 색인 엔진에서 후보 청크를 조회하고 공통 RAG 형식으로 변환함"""
+    if vector_store_type == "pgvector":
+        if search_mode == "hybrid":
+            return search_chunks_hybrid(
+                settings,
+                query_embedding,
+                query_text,
+                top_k=top_k,
+                document_id=document_id,
+                document_ids=document_ids,
+                min_quality_score=min_quality_score,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+            )
+        return search_chunks(
+            settings,
+            query_embedding,
+            top_k=top_k,
+            document_id=document_id,
+            document_ids=document_ids,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+        )
+
+    store = get_vector_store(settings, vector_store_type)
+    search = store.search_hybrid if search_mode == "hybrid" else store.search
+    kwargs: dict[str, Any] = {
+        "query_vector": query_embedding,
+        "top_k": top_k,
+        "document_id": document_id,
+        "document_ids": document_ids,
+        "min_quality_score": min_quality_score,
+        "project_name": project_name,
+        "department": department,
+        "max_security_level": max_security_level,
+    }
+    if search_mode == "hybrid":
+        kwargs["query_text"] = query_text
+    store_hits = search(**kwargs)
+    results: list[dict[str, Any]] = []
+    for hit in store_hits:
+        hit_document_id = hit.get("document_id")
+        try:
+            parsed_document_id = UUID(str(hit_document_id))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        results.append({
+            "document_id": parsed_document_id,
+            "source_name": hit.get("source_name") or "unknown",
+            "source_type": hit.get("source_type") or "unknown",
+            "chunk_index": hit.get("chunk_index", 0),
+            "text": hit.get("content", "") or "",
+            "content": hit.get("content", "") or "",
+            "score": hit.get("combined_score", 0.0),
+            "metadata": hit.get("metadata", {}),
+            "quality_score": hit.get("quality_score", 100),
+        })
+    return results
 
 
 def evaluate_answer_attribution(
@@ -425,11 +521,15 @@ def query_rag(
         if options is not None and options.enable_guardrails is not None
         else settings.guardrails_enabled
     )
-    store_type = (
-        options.vector_store_type
-        if options is not None and options.vector_store_type is not None
-        else settings.vector_store_type
-    )
+    if (
+        options is not None
+        and options.vector_store_type is not None
+        and options.vector_store_type != settings.vector_store_type
+    ):
+        raise ValueError(
+            "질의 시 벡터 저장소를 바꿀 수 없습니다. 인제스트에 사용한 VECTOR_STORE_TYPE과 같아야 합니다."
+        )
+    store_type = settings.vector_store_type
 
     # LMOps 생애주기 트레이스 컨텍스트 생성함
     trace = TraceContext(
@@ -485,7 +585,11 @@ def query_rag(
     query_embedding = embedder.embed_query(question)
     span_embed.finish()
 
-    filter_key = f"{document_id}:{project_name}:{department}:{max_security_level}:{min_quality_score}:{top_k}:{search_mode}:{store_type}"
+    filter_key = (
+        f"{document_id}:{project_name}:{department}:{max_security_level}:{min_quality_score}:"
+        f"{top_k}:{search_mode}:{store_type}:{guardrails_enabled}:"
+        f"{settings.guardrails_mask_pii}:{settings.guardrails_block_on_injection}"
+    )
     if use_llm:
         cached_result = _find_semantic_cache(query_embedding, filter_key)
         if cached_result is not None:
@@ -494,66 +598,19 @@ def query_rag(
     # 3. 벡터 및 하이브리드 검색 스팬 수행함
     span_retrieve = trace.start_span("retrieval", {"store_type": store_type, "search_mode": search_mode})
     candidate_k = max(15, top_k * 3)
-    if store_type != "pgvector":
-        vstore = get_vector_store(settings, store_type)
-        if search_mode == "hybrid":
-            store_hits = vstore.search_hybrid(
-                query_vector=query_embedding,
-                query_text=question,
-                top_k=candidate_k,
-                document_id=document_id,
-                min_quality_score=min_quality_score,
-                project_name=project_name,
-                department=department,
-                max_security_level=max_security_level,
-            )
-        else:
-            store_hits = vstore.search(
-                query_vector=query_embedding,
-                top_k=candidate_k,
-                document_id=document_id,
-                min_quality_score=min_quality_score,
-                project_name=project_name,
-                department=department,
-                max_security_level=max_security_level,
-            )
-        raw_hits = []
-        for sh in store_hits:
-            raw_hits.append({
-                "document_id": UUID(sh["document_id"]) if isinstance(sh["document_id"], str) else sh["document_id"],
-                "source_name": sh.get("source_name", "unknown"),
-                "source_type": sh.get("source_type", "unknown"),
-                "chunk_index": sh.get("chunk_index", 0),
-                "text": sh.get("content", ""),
-                "content": sh.get("content", ""),
-                "score": sh.get("combined_score", 0.0),
-                "metadata": sh.get("metadata", {}),
-                "quality_score": sh.get("quality_score", 100),
-            })
-    else:
-        if search_mode == "hybrid":
-            raw_hits = search_chunks_hybrid(
-                settings,
-                query_embedding,
-                question,
-                top_k=candidate_k,
-                document_id=document_id,
-                min_quality_score=min_quality_score,
-                project_name=project_name,
-                department=department,
-                max_security_level=max_security_level,
-            )
-        else:
-            raw_hits = search_chunks(
-                settings,
-                query_embedding,
-                top_k=candidate_k,
-                document_id=document_id,
-                min_quality_score=min_quality_score,
-                project_name=project_name,
-                department=department,
-                max_security_level=max_security_level,
-            )
+    raw_hits = _retrieve_candidates(
+        settings,
+        vector_store_type=store_type,
+        query_embedding=query_embedding,
+        query_text=question,
+        top_k=candidate_k,
+        document_id=document_id,
+        min_quality_score=min_quality_score,
+        project_name=project_name,
+        department=department,
+        max_security_level=max_security_level,
+        search_mode=search_mode,
+    )
     span_retrieve.finish({"candidates_count": len(raw_hits)})
 
     # 4. 신경망 또는 휴리스틱 리랭커 스팬 수행함
@@ -577,11 +634,23 @@ def query_rag(
         if out_result.violations:
             for v in out_result.violations:
                 input_violations.append(asdict(v))
-        if out_result.action == GuardrailAction.MASK:
+        severe_output_violation = any(
+            v.severity in {"critical", "high"}
+            and v.category in {"faithfulness", "system_leak", "safety"}
+            for v in out_result.violations
+        )
+        if severe_output_violation:
+            trace.guardrail_action = GuardrailAction.BLOCK.value
+            answer = "검색 근거에서 답변 내용을 충분히 확인할 수 없어 응답을 보류했습니다."
+        elif out_result.action == GuardrailAction.MASK:
+            trace.guardrail_action = GuardrailAction.MASK.value
             answer = out_result.sanitized_text
+        elif out_result.action == GuardrailAction.FLAG and trace.guardrail_action == GuardrailAction.ALLOW.value:
+            trace.guardrail_action = GuardrailAction.FLAG.value
         span_outguard.finish({"action": out_result.action.value, "risk_score": out_result.risk_score})
     else:
         span_outguard.finish({"skipped": True})
+    trace.guardrail_violations = input_violations
 
     # 7. 오프라인 정량 평가(Eval) 지표 산출함
     span_eval = trace.start_span("evaluation")
@@ -669,8 +738,16 @@ def stream_query_rag(
     max_security_level: int | None = None,
     client_ip: str | None = None,
 ) -> Any:
-    """검색 및 리랭킹 후 출처 메타데이터와 LLM 생성 토큰을 SSE 이벤트로 순차 스트리밍함"""
+    """가드레일 검사를 마친 답변과 출처 메타데이터를 SSE 이벤트로 전달함"""
     import json
+
+    def emit(payload: dict[str, Any]) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def emit_answer(answer: str) -> Any:
+        # 출력 검사가 끝난 문자열만 전달하며, 긴 답변은 작은 조각으로 나눠 SSE로 보냄.
+        for offset in range(0, len(answer), 48):
+            yield emit({"type": "token", "content": answer[offset : offset + 48]})
 
     if options is not None:
         top_k = options.top_k
@@ -681,39 +758,84 @@ def stream_query_rag(
         max_security_level = options.max_security_level
         search_mode = options.search_mode
         client_ip = options.client_ip
+        if options.vector_store_type is not None and options.vector_store_type != settings.vector_store_type:
+            yield f"data: {json.dumps({'type': 'error', 'message': '질의 저장소는 VECTOR_STORE_TYPE 설정과 같아야 합니다.'}, ensure_ascii=False)}\n\n"
+            return
 
     question = question.strip()
     if not question:
-        yield f"data: {json.dumps({'type': 'error', 'message': '질문이 비어 있습니다.'}, ensure_ascii=False)}\n\n"
+        yield emit({"type": "error", "message": "질문이 비어 있습니다."})
         return
+
+    original_question_length = len(question)
+    guardrails_enabled = (
+        options.enable_guardrails
+        if options is not None and options.enable_guardrails is not None
+        else settings.guardrails_enabled
+    )
+    input_action = GuardrailAction.ALLOW
+    input_violations: list[dict[str, Any]] = []
+    if guardrails_enabled:
+        input_result = InputGuardrail(
+            block_on_injection=settings.guardrails_block_on_injection,
+            mask_pii=settings.guardrails_mask_pii,
+        ).validate(question)
+        input_action = input_result.action
+        input_violations = [asdict(violation) for violation in input_result.violations]
+        if input_action == GuardrailAction.BLOCK:
+            blocked_answer = "보안 가드레일이 질의를 차단했습니다."
+            yield emit({"type": "sources", "sources": []})
+            yield emit({"type": "guardrail", "action": input_action.value, "violations": [
+                {"category": violation["category"], "severity": violation["severity"]}
+                for violation in input_violations
+            ]})
+            yield from emit_answer(blocked_answer)
+            yield emit({
+                "type": "attribution",
+                "confidence_score": 0.0,
+                "hallucination_risk": "high",
+                "attribution_details": {"blocked_by_guardrail": True},
+            })
+            record_audit_log(
+                settings,
+                query=f"omitted;chars:{original_question_length}",
+                search_mode=search_mode,
+                client_ip=client_ip,
+                hit_count=0,
+                confidence_score=0.0,
+                hallucination_risk="high",
+            )
+            yield "data: [DONE]\n\n"
+            return
+        if input_action == GuardrailAction.MASK:
+            question = input_result.sanitized_text
+
+    yield emit({
+        "type": "guardrail",
+        "action": input_action.value,
+        "violations": [
+            {"category": violation["category"], "severity": violation["severity"]}
+            for violation in input_violations
+        ],
+    })
 
     embedder = get_embedder(settings)
     query_embedding = embedder.embed_query(question)
 
     candidate_k = max(15, top_k * 3)
-    if search_mode == "hybrid":
-        raw_hits = search_chunks_hybrid(
-            settings,
-            query_embedding,
-            question,
-            top_k=candidate_k,
-            document_id=document_id,
-            min_quality_score=min_quality_score,
-            project_name=project_name,
-            department=department,
-            max_security_level=max_security_level,
-        )
-    else:
-        raw_hits = search_chunks(
-            settings,
-            query_embedding,
-            top_k=candidate_k,
-            document_id=document_id,
-            min_quality_score=min_quality_score,
-            project_name=project_name,
-            department=department,
-            max_security_level=max_security_level,
-        )
+    raw_hits = _retrieve_candidates(
+        settings,
+        vector_store_type=settings.vector_store_type,
+        query_embedding=query_embedding,
+        query_text=question,
+        top_k=candidate_k,
+        document_id=document_id,
+        min_quality_score=min_quality_score,
+        project_name=project_name,
+        department=department,
+        max_security_level=max_security_level,
+        search_mode=search_mode,
+    )
 
     reranker = get_reranker(settings)
     hits = rerank_chunks(question, raw_hits, top_k=top_k, reranker=reranker)
@@ -732,7 +854,7 @@ def stream_query_rag(
     ]
 
     # 1. 출처 및 근거 메타데이터 전송
-    yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
+    yield emit({"type": "sources", "sources": sources})
 
     context = build_context(hits)
     llm = LLMClient(settings)
@@ -740,34 +862,62 @@ def stream_query_rag(
     if not hits:
         record_audit_log(
             settings,
-            query=f"omitted;chars:{len(question)}",
+            query=f"omitted;chars:{original_question_length}",
             search_mode=search_mode,
             client_ip=client_ip,
             hit_count=0,
             confidence_score=0.0,
             hallucination_risk="high",
         )
-        yield f"data: {json.dumps({'type': 'token', 'content': '관련 근거 문서를 찾을 수 없습니다.'}, ensure_ascii=False)}\n\n"
+        yield from emit_answer("관련 근거 문서를 찾을 수 없습니다.")
         yield "data: [DONE]\n\n"
         return
 
     if not llm.configured:
-        yield f"data: {json.dumps({'type': 'token', 'content': 'LLM 설정이 완료되지 않았습니다.'}, ensure_ascii=False)}\n\n"
+        yield from emit_answer("LLM 설정이 완료되지 않았습니다.")
         yield "data: [DONE]\n\n"
         return
 
     full_answer_parts: list[str] = []
     for token in llm.complete_stream(question, context):
         full_answer_parts.append(token)
-        yield f"data: {json.dumps({'type': 'token', 'content': token}, ensure_ascii=False)}\n\n"
 
     full_answer = "".join(full_answer_parts)
+    guardrail_action = input_action
+    output_violations: list[dict[str, Any]] = []
+    if guardrails_enabled and full_answer:
+        output_result = OutputGuardrail(mask_pii=settings.guardrails_mask_pii).validate(full_answer, hits)
+        output_violations = [asdict(violation) for violation in output_result.violations]
+        severe_output_violation = any(
+            violation.severity in {"critical", "high"}
+            and violation.category in {"faithfulness", "system_leak", "safety"}
+            for violation in output_result.violations
+        )
+        if severe_output_violation:
+            guardrail_action = GuardrailAction.BLOCK
+            full_answer = "검색 근거에서 답변 내용을 충분히 확인할 수 없어 응답을 보류했습니다."
+        elif output_result.action == GuardrailAction.MASK:
+            guardrail_action = GuardrailAction.MASK
+            full_answer = output_result.sanitized_text
+        elif output_result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
+            guardrail_action = GuardrailAction.FLAG
+
+    yield emit({
+        "type": "guardrail",
+        "action": guardrail_action.value,
+        "violations": [
+            {"category": violation["category"], "severity": violation["severity"]}
+            for violation in output_violations
+        ],
+    })
+    yield from emit_answer(full_answer)
+
     confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(full_answer, hits)
 
     # SECURITY: 스트리밍 질의에 대해서도 감사 로그를 동일하게 기록함
     record_audit_log(
         settings,
-        query=f"omitted;chars:{len(question)}",
+        query=f"omitted;chars:{original_question_length}",
         search_mode=search_mode,
         client_ip=client_ip,
         hit_count=len(hits),
@@ -877,17 +1027,55 @@ def draft_document(
     if target_document_ids is not None and not target_document_ids:
         raise ValueError("target_document_ids는 생략하거나 하나 이상의 문서 ID를 지정해야 합니다.")
 
+    guardrail_action = GuardrailAction.ALLOW
+    guardrail_violations: list[dict[str, str]] = []
+    if settings.guardrails_enabled:
+        input_guard = InputGuardrail(
+            block_on_injection=settings.guardrails_block_on_injection,
+            mask_pii=settings.guardrails_mask_pii,
+        )
+        safe_fields: list[str] = []
+        for field_value in (title, instructions):
+            result = input_guard.validate(field_value)
+            guardrail_violations.extend(
+                {"category": violation.category, "severity": violation.severity}
+                for violation in result.violations
+            )
+            if result.action == GuardrailAction.BLOCK:
+                return {
+                    "title": title,
+                    "style": style,
+                    "content": "보안 가드레일이 문서 초안 요청을 차단했습니다.",
+                    "sources": [],
+                    "guardrail_action": GuardrailAction.BLOCK.value,
+                    "guardrail_violations": guardrail_violations,
+                }
+            if result.action == GuardrailAction.MASK:
+                guardrail_action = GuardrailAction.MASK
+                safe_fields.append(result.sanitized_text)
+            else:
+                if result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
+                    guardrail_action = GuardrailAction.FLAG
+                safe_fields.append(field_value)
+        title, instructions = safe_fields
+
     search_query = f"{title} {instructions}".strip()
     embedder = get_embedder(settings)
     query_embedding = embedder.embed_query(search_query)
 
-    candidates = search_chunks_hybrid(
+    candidates = _retrieve_candidates(
         settings,
-        query_embedding,
-        search_query,
+        vector_store_type=settings.vector_store_type,
+        query_embedding=query_embedding,
+        query_text=search_query,
         top_k=max(15, top_k * 3),
+        document_id=None,
         document_ids=list(dict.fromkeys(target_document_ids)) if target_document_ids else None,
         project_name=project_name,
+        min_quality_score=None,
+        department=None,
+        max_security_level=None,
+        search_mode="hybrid",
     )
     hits = rerank_chunks(search_query, candidates, top_k=top_k, reranker=get_reranker(settings))
     context = build_context(hits)
@@ -897,11 +1085,32 @@ def draft_document(
 
     llm = LLMClient(settings)
     content = llm.complete(user_prompt, context, system_prompt=system_prompt) if hits else "관련 근거 문서를 찾을 수 없습니다."
+    if settings.guardrails_enabled and content:
+        output_result = OutputGuardrail(mask_pii=settings.guardrails_mask_pii).validate(content, hits)
+        guardrail_violations.extend(
+            {"category": violation.category, "severity": violation.severity}
+            for violation in output_result.violations
+        )
+        severe_output_violation = any(
+            violation.severity in {"critical", "high"}
+            and violation.category in {"faithfulness", "system_leak", "safety"}
+            for violation in output_result.violations
+        )
+        if severe_output_violation:
+            guardrail_action = GuardrailAction.BLOCK
+            content = "검색 근거에서 초안 내용을 충분히 확인할 수 없어 응답을 보류했습니다."
+        elif output_result.action == GuardrailAction.MASK:
+            guardrail_action = GuardrailAction.MASK
+            content = output_result.sanitized_text
+        elif output_result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
+            guardrail_action = GuardrailAction.FLAG
 
     return {
         "title": title,
         "style": style,
         "content": content or "문서 초안을 작성하지 못했습니다.",
+        "guardrail_action": guardrail_action.value,
+        "guardrail_violations": guardrail_violations,
         "sources": [
             {
                 "rank": index,
@@ -1005,12 +1214,19 @@ def extract_document_entities(
             raise ValueError(f"ID가 {document_id}인 문서를 찾을 수 없습니다.")
         source_name = doc["source_name"]
         query_embedding = get_embedder(settings).embed_query(schema_query)
-        candidates = search_chunks_hybrid(
+        candidates = _retrieve_candidates(
             settings,
-            query_embedding,
-            schema_query,
+            vector_store_type=settings.vector_store_type,
+            query_embedding=query_embedding,
+            query_text=schema_query,
             top_k=10,
             document_id=document_id,
+            document_ids=None,
+            min_quality_score=None,
+            project_name=None,
+            department=None,
+            max_security_level=None,
+            search_mode="hybrid",
         )
         relevant_chunks = rerank_chunks(
             schema_query,
@@ -1032,6 +1248,33 @@ def extract_document_entities(
     if not target_text:
         raise ValueError("분석할 텍스트 내용이 비어 있습니다.")
 
+    guardrail_action = GuardrailAction.ALLOW
+    guardrail_violations: list[dict[str, str]] = []
+    prompt_text = target_text[:5000]
+    if settings.guardrails_enabled:
+        input_result = InputGuardrail(
+            block_on_injection=settings.guardrails_block_on_injection,
+            mask_pii=settings.guardrails_mask_pii,
+            max_length=5000,
+        ).validate(prompt_text)
+        guardrail_violations.extend(
+            {"category": violation.category, "severity": violation.severity}
+            for violation in input_result.violations
+        )
+        if input_result.action == GuardrailAction.BLOCK:
+            return {
+                "source_name": source_name,
+                "schema_type": schema_type,
+                "extracted_data": {"error": "보안 가드레일이 추출 요청을 차단했습니다.", "response_omitted": True},
+                "guardrail_action": GuardrailAction.BLOCK.value,
+                "guardrail_violations": guardrail_violations,
+            }
+        if input_result.action == GuardrailAction.MASK:
+            prompt_text = input_result.sanitized_text
+            guardrail_action = GuardrailAction.MASK
+        elif input_result.action == GuardrailAction.FLAG:
+            guardrail_action = GuardrailAction.FLAG
+
     schema_sample = json.dumps(schema_info["sample"], ensure_ascii=False, indent=2)
 
     system_prompt = (
@@ -1044,17 +1287,41 @@ def extract_document_entities(
 
     llm = LLMClient(settings)
     raw_response = llm.complete(
-        f"다음 문서에서 '{schema_type}' 정보를 추출하십시오:\n\n{target_text[:5000]}",
+        f"다음 문서에서 '{schema_type}' 정보를 추출하십시오:\n\n{prompt_text}",
         "",
         system_prompt=system_prompt,
     )
 
+    response_for_parsing = raw_response
+    if settings.guardrails_enabled and raw_response:
+        # 구조화 추출은 스키마 키가 문맥에 그대로 나타나지 않을 수 있으므로
+        # 출력 가드레일에서는 PII와 시스템 프롬프트 유출을 확인하고 faithfulness는 별도 평가함.
+        output_result = OutputGuardrail(mask_pii=settings.guardrails_mask_pii).validate(raw_response)
+        guardrail_violations.extend(
+            {"category": violation.category, "severity": violation.severity}
+            for violation in output_result.violations
+        )
+        if any(
+            violation.severity in {"critical", "high"}
+            and violation.category in {"system_leak", "safety"}
+            for violation in output_result.violations
+        ):
+            response_for_parsing = ""
+            guardrail_action = GuardrailAction.BLOCK
+        elif output_result.action == GuardrailAction.MASK:
+            response_for_parsing = output_result.sanitized_text
+            guardrail_action = GuardrailAction.MASK
+        elif output_result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
+            guardrail_action = GuardrailAction.FLAG
+
     extracted_dict: dict[str, Any]
-    if not raw_response:
+    if guardrail_action == GuardrailAction.BLOCK:
+        extracted_dict = {"error": "보안 가드레일이 추출 결과를 차단했습니다.", "response_omitted": True}
+    elif not response_for_parsing:
         extracted_dict = {"error": "LLM 응답을 생성하지 못했습니다."}
     else:
         # SECURITY: 파싱 실패 시 모델 응답을 그대로 반환하지 않아 반복된 원문 노출을 줄임
-        cleaned = raw_response.strip()
+        cleaned = response_for_parsing.strip()
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         parsed: Any = None
@@ -1082,6 +1349,8 @@ def extract_document_entities(
         "source_name": source_name,
         "schema_type": schema_type,
         "extracted_data": extracted_dict,
+        "guardrail_action": guardrail_action.value,
+        "guardrail_violations": guardrail_violations,
     }
 
 
@@ -1132,6 +1401,12 @@ def get_chunks_for_document(settings: Settings, document_id: UUID) -> list[dict[
 
 def remove_document(settings: Settings, document_id: UUID) -> bool:
     """문서와 연결된 청크를 삭제하고 삭제 여부를 반환함"""
+    if get_document(settings, document_id) is None:
+        return False
+    if settings.vector_store_type != "pgvector":
+        vector_store = get_vector_store(settings)
+        if not vector_store.delete_document(document_id):
+            raise ConnectionError("선택된 벡터 저장소에서 문서 색인을 삭제하지 못했습니다.")
     deleted = delete_document(settings, document_id)
     if deleted:
         clear_semantic_cache()

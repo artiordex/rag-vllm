@@ -27,6 +27,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .config import Settings
+from .standardization import detect_and_mask_pii
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,20 @@ class LmopsManager:
         """완료된 트레이스를 데이터베이스 및 로컬 JSONL 파일에 기록함"""
         trace_data = trace.to_dict()
 
+        # TraceContext는 요청 원문을 포함할 수 있으므로 저장 경계에서 다시 필터링함.
+        # 보관이 명시적으로 허용된 경우에도 패턴 기반 PII 마스킹을 항상 적용함.
+        if getattr(self.settings, "lmops_store_query_text", False):
+            safe_query, _ = detect_and_mask_pii(trace.query_text, mask=True)
+            trace_data["query_text"] = safe_query
+        else:
+            trace_data["query_text"] = ""
+
+        if getattr(self.settings, "lmops_store_answer_text", False) and trace.answer_text:
+            safe_answer, _ = detect_and_mask_pii(trace.answer_text, mask=True)
+            trace_data["answer_text"] = safe_answer
+        else:
+            trace_data["answer_text"] = None
+
         # 1. 로컬 JSONL 파일 백업 기록함
         try:
             with open(self.log_file, "a", encoding="utf-8") as f:
@@ -221,8 +236,8 @@ class LmopsManager:
                     (
                         trace.trace_id,
                         trace.client_ip,
-                        trace.query_text,
-                        trace.answer_text,
+                        trace_data["query_text"],
+                        trace_data["answer_text"],
                         trace.model_name,
                         trace.vector_store_type,
                         trace.total_latency_ms,
@@ -254,6 +269,16 @@ class LmopsManager:
         """사용자 피드백을 기록하고 피드백 ID를 반환함"""
         from .db import _connect
 
+        if getattr(self.settings, "lmops_store_feedback_text", False):
+            safe_comment, _ = detect_and_mask_pii(comment or "", mask=True)
+            safe_corrected_answer, _ = detect_and_mask_pii(corrected_answer or "", mask=True)
+            stored_comment = safe_comment or None
+            stored_corrected_answer = safe_corrected_answer or None
+        else:
+            stored_comment = None
+            stored_corrected_answer = None
+        stored_user_id = user_id if getattr(self.settings, "lmops_store_user_id", False) else None
+
         with _connect(self.settings) as conn:
             self.init_schema(conn)
             cur = conn.execute(
@@ -263,7 +288,7 @@ class LmopsManager:
                 ) VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (trace_id, thumbs, rating, comment, corrected_answer, user_id),
+                (trace_id, thumbs, rating, stored_comment, stored_corrected_answer, stored_user_id),
             )
             row = cur.fetchone()
             conn.commit()

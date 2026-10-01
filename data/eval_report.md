@@ -1,21 +1,9 @@
-# RAG 로컬 오프라인 정량 평가 리포트
+# 이전 로컬 휴리스틱 결과 (RAG 벤치마크 아님)
 
-- **평가 엔진**: Local Offline Heuristic & Tokenizer Evaluator
-- **데이터셋**: `data/sft/alpaca_sft_dataset.json` (샘플 수: 4)
-- **총 소요시간**: 0.00초
-- **평균 종합 점수**: **38.5 / 100**
+이 파일의 과거 수치는 `data/sft/alpaca_sft_dataset.json`의 4개 SFT 샘플을 질의·문맥·답변처럼 재사용하고 지연시간을 15ms로 고정해 계산한 결과다. 실제 RAG API를 실행한 평가가 아니므로 모델·검색 품질이나 운영 지연시간의 근거로 사용하지 않는다.
 
-## 주요 지표 요약
+실제 평가를 위해 `query`와 `ground_truth`를 담은 별도 골든셋을 준비하고 다음 CLI를 실행한다.
 
-| 평가지표 | 측정값 | 기준/상태 |
-| :--- | :--- | :--- |
-| **Faithfulness (문맥 충실도)** | 0.438 | 개선 권장 |
-| **Answer Relevance (답변 적합성)** | 0.174 | 개선 권장 |
-| **Context Precision (문맥 정밀도)** | 1.000 | 우수 |
-| **High Hallucination Rate (고환각 위험률)** | 50.0% | 주의 |
-| **p50 Latency** | 15.0 ms | 지연시간 중간값 |
-| **p95 Latency** | 15.0 ms | 지연시간 상위 95% |
-
-## 검증 환경 특이사항
-- 외부 클라우드(Azure, AWS) 사용 0건 (100% 로컬 환경 구동)
-- 오프라인 자가 진단 및 폐쇄망 준수
+```bash
+uv run python scripts/run_eval.py --dataset ./rag_golden_set.jsonl --api-url http://127.0.0.1:11020
+```

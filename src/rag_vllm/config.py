@@ -92,6 +92,10 @@ class Settings:
     guardrails_mask_pii: bool = True
     lmops_enabled: bool = True
     lmops_log_file: str = "data/lmops_traces.jsonl"
+    lmops_store_query_text: bool = False
+    lmops_store_answer_text: bool = False
+    lmops_store_feedback_text: bool = False
+    lmops_store_user_id: bool = False
     eval_judge_model: str = "rag-vllm-model"
     eval_judge_base_url: str = "http://127.0.0.1:11435/v1"
 
@@ -136,6 +140,8 @@ class Settings:
             raise ValueError("DATABASE_MAX_POOL_SIZE must be >= DATABASE_MIN_POOL_SIZE")
         if self.database_pool_timeout <= 0:
             raise ValueError("DATABASE_POOL_TIMEOUT must be positive")
+        if self.vector_store_type not in {"pgvector", "qdrant", "weaviate"}:
+            raise ValueError("VECTOR_STORE_TYPE must be 'pgvector', 'qdrant', or 'weaviate'")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -185,6 +191,10 @@ class Settings:
             guardrails_mask_pii=_bool_env("GUARDRAILS_MASK_PII", True),
             lmops_enabled=_bool_env("LMOPS_ENABLED", True),
             lmops_log_file=os.getenv("LMOPS_LOG_FILE", "data/lmops_traces.jsonl"),
+            lmops_store_query_text=_bool_env("LMOPS_STORE_QUERY_TEXT", False),
+            lmops_store_answer_text=_bool_env("LMOPS_STORE_ANSWER_TEXT", False),
+            lmops_store_feedback_text=_bool_env("LMOPS_STORE_FEEDBACK_TEXT", False),
+            lmops_store_user_id=_bool_env("LMOPS_STORE_USER_ID", False),
             eval_judge_model=os.getenv("EVAL_JUDGE_MODEL", "rag-vllm-model"),
             eval_judge_base_url=os.getenv("EVAL_JUDGE_BASE_URL", "http://127.0.0.1:11435/v1"),
         )

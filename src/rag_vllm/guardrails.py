@@ -365,7 +365,9 @@ class OutputGuardrail:
         hallucination_score = 0.0
         if context_chunks:
             combined_context = " ".join(
-                str(c.get("content", "")) for c in context_chunks if isinstance(c, dict)
+                str(c.get("text", c.get("content", "")))
+                for c in context_chunks
+                if isinstance(c, dict)
             )
             # 답변 문장 단위 분할 후 문맥 내 키워드 일치율 측정함
             sentences = [s.strip() for s in re.split(r"[.?!]\s+", answer) if len(s.strip()) > 10]

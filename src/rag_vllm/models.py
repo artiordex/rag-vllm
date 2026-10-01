@@ -138,7 +138,10 @@ class QueryRequest(BaseModel):
         description="검색 모드: 'hybrid' (하이브리드 RRF) 또는 'dense' (벡터 유사도)",
     )
     enable_guardrails: bool | None = Field(default=None, description="가드레일 검사 활성화 여부임")
-    vector_store_type: str | None = Field(default=None, description="사용할 벡터 저장소: pgvector, qdrant, weaviate")
+    vector_store_type: Literal["pgvector", "qdrant", "weaviate"] | None = Field(
+        default=None,
+        description="VECTOR_STORE_TYPE 설정과 동일해야 하는 벡터 저장소",
+    )
 
     def to_options(self, client_ip: str | None = None) -> QueryOptions:
         """QueryRequest 스키마를 내부 서비스용 QueryOptions 불변 객체로 변환함"""
@@ -329,6 +332,8 @@ class DraftResponse(BaseModel):
     style: str
     content: str
     sources: list[SourceHit]
+    guardrail_action: str = "allow"
+    guardrail_violations: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ExtractionRequest(BaseModel):
@@ -348,6 +353,8 @@ class ExtractionResponse(BaseModel):
     source_name: str
     schema_type: str
     extracted_data: dict[str, Any]
+    guardrail_action: str = "allow"
+    guardrail_violations: list[dict[str, str]] = Field(default_factory=list)
 
 
 # =============================================================================
@@ -460,4 +467,3 @@ class VectorStoreStatusResponse(BaseModel):
     active_engine: str
     health: bool
     stats: dict[str, Any]
-
