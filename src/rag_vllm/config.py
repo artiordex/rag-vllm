@@ -84,6 +84,16 @@ class Settings:
     database_min_pool_size: int = 1
     database_max_pool_size: int = 10
     database_pool_timeout: float = 30.0
+    vector_store_type: str = "pgvector"
+    qdrant_url: str = "http://127.0.0.1:6333"
+    weaviate_url: str = "http://127.0.0.1:8080"
+    guardrails_enabled: bool = True
+    guardrails_block_on_injection: bool = True
+    guardrails_mask_pii: bool = True
+    lmops_enabled: bool = True
+    lmops_log_file: str = "data/lmops_traces.jsonl"
+    eval_judge_model: str = "rag-vllm-model"
+    eval_judge_base_url: str = "http://127.0.0.1:11435/v1"
 
     def __post_init__(self) -> None:
         """인제스트나 검색을 사용할 수 없게 만드는 설정을 조기 검증함"""
@@ -167,6 +177,16 @@ class Settings:
             database_min_pool_size=_int_env("DATABASE_MIN_POOL_SIZE", 1),
             database_max_pool_size=_int_env("DATABASE_MAX_POOL_SIZE", 10),
             database_pool_timeout=_float_env("DATABASE_POOL_TIMEOUT", 30.0),
+            vector_store_type=os.getenv("VECTOR_STORE_TYPE", "pgvector").strip().lower(),
+            qdrant_url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
+            weaviate_url=os.getenv("WEAVIATE_URL", "http://127.0.0.1:8080"),
+            guardrails_enabled=_bool_env("GUARDRAILS_ENABLED", True),
+            guardrails_block_on_injection=_bool_env("GUARDRAILS_BLOCK_ON_INJECTION", True),
+            guardrails_mask_pii=_bool_env("GUARDRAILS_MASK_PII", True),
+            lmops_enabled=_bool_env("LMOPS_ENABLED", True),
+            lmops_log_file=os.getenv("LMOPS_LOG_FILE", "data/lmops_traces.jsonl"),
+            eval_judge_model=os.getenv("EVAL_JUDGE_MODEL", "rag-vllm-model"),
+            eval_judge_base_url=os.getenv("EVAL_JUDGE_BASE_URL", "http://127.0.0.1:11435/v1"),
         )
 
 

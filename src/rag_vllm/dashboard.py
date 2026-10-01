@@ -95,6 +95,10 @@ def get_dashboard_html() -> str:
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
           <span>시스템 & n8n 연동</span>
         </button>
+        <button onclick="switchTab('lmops')" id="tab-lmops" class="text-slate-500 hover:text-slate-700 py-3 px-1 text-sm font-medium border-b-2 border-transparent flex items-center space-x-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+          <span>LMOps & 가드레일</span>
+        </button>
       </nav>
       <div class="flex flex-col sm:flex-row sm:items-center gap-2 border-t border-slate-100 py-2 text-xs">
         <label for="api-key-input" class="font-medium text-slate-600">RAG API 키</label>
@@ -465,6 +469,119 @@ def get_dashboard_html() -> str:
       </div>
     </section>
 
+    <!-- ========================================== -->
+    <!-- 탭 6: LMOps, 가드레일 & 정량 평가 패널 -->
+    <!-- ========================================== -->
+    <section id="panel-lmops" class="hidden space-y-6">
+      <!-- 핵심 KPI 지표 카드 그리드 -->
+      <div class="grid grid-cols-2 md:grid-cols-6 gap-4">
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">누적 질의</div>
+          <div class="text-2xl font-bold text-slate-900 mt-1" id="lmops-total-queries">-</div>
+          <div class="text-xs text-blue-600 mt-1 font-medium">100% 로컬 처리</div>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">평균 지연시간</div>
+          <div class="text-2xl font-bold text-slate-900 mt-1"><span id="lmops-avg-latency">-</span> <span class="text-xs font-normal text-slate-500">ms</span></div>
+          <div class="text-xs text-slate-500 mt-1">E2E 파이프라인</div>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">누적 소비 토큰</div>
+          <div class="text-2xl font-bold text-slate-900 mt-1" id="lmops-total-tokens">-</div>
+          <div class="text-xs text-emerald-600 mt-1 font-medium">추가 비용: $0.00</div>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">가드레일 차단율</div>
+          <div class="text-2xl font-bold text-slate-900 mt-1"><span id="lmops-block-rate">-</span>%</div>
+          <div class="text-xs text-amber-600 mt-1 font-medium">인젝션/탈옥 차단</div>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">고환각 위험 건</div>
+          <div class="text-2xl font-bold text-slate-900 mt-1" id="lmops-high-risk">-</div>
+          <div class="text-xs text-slate-500 mt-1">문맥 미지원 진술</div>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">피드백 평점</div>
+          <div class="text-2xl font-bold text-slate-900 mt-1"><span id="lmops-avg-rating">-</span> <span class="text-xs font-normal text-slate-500">/ 5.0</span></div>
+          <div class="text-xs text-slate-500 mt-1" id="lmops-feedback-count">-건 수집됨</div>
+        </div>
+      </div>
+
+      <!-- 상단 컨트롤 및 SFT 내보내기 배너 -->
+      <div class="bg-gradient-to-r from-blue-900 to-indigo-900 rounded-xl p-5 text-white flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shadow-sm">
+        <div>
+          <h3 class="text-base font-bold">지속적 모델 개선 (Continuous SFT & LoRA Data Curation)</h3>
+          <p class="text-xs text-blue-200 mt-0.5">사용자 추천(Thumbs Up) 및 평점 4점 이상의 고품질 질의응답을 SFT 파인튜닝 데이터셋으로 즉시 변환합니다.</p>
+        </div>
+        <div class="flex items-center space-x-2">
+          <button onclick="exportCuratedSft()" class="px-4 py-2 bg-blue-500 hover:bg-blue-400 text-white rounded-lg text-xs font-bold shadow transition">
+            고품질 QA를 SFT 데이터로 내보내기
+          </button>
+          <button onclick="loadLmopsData()" class="px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg text-xs font-medium transition">
+            새로고침
+          </button>
+        </div>
+      </div>
+
+      <!-- 2컬럼 레이아웃: 최근 트레이스 로그 & 대화형 도구 -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- 좌측: 최근 트레이스 목록 (2 cols) -->
+        <div class="lg:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="text-base font-bold text-slate-900">최근 RAG 트레이스 로그</h3>
+            <span class="text-xs text-slate-500">PostgreSQL rag_lmops_traces 연동</span>
+          </div>
+          <div class="overflow-x-auto max-h-96">
+            <table class="w-full text-xs text-left border-collapse">
+              <thead class="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold sticky top-0">
+                <tr>
+                  <th class="py-2.5 px-3">질의 요약</th>
+                  <th class="py-2.5 px-3">가드레일</th>
+                  <th class="py-2.5 px-3 text-right">지연시간</th>
+                  <th class="py-2.5 px-3 text-right">토큰</th>
+                  <th class="py-2.5 px-3">환각위험</th>
+                  <th class="py-2.5 px-3">기록일시</th>
+                </tr>
+              </thead>
+              <tbody id="lmops-traces-body" class="divide-y divide-slate-100">
+                <tr><td colspan="6" class="text-center py-6 text-slate-400">트레이스 데이터를 조회하는 중...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 우측: 가드레일 사전 진단 & 로컬 평가기 도구 (1 col) -->
+        <div class="space-y-6">
+          <!-- 가드레일 검사기 -->
+          <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+            <h4 class="text-sm font-bold text-slate-900 mb-1">가드레일 실시간 테스트</h4>
+            <p class="text-xs text-slate-500 mb-3">탈옥, 프롬프트 인젝션, 주민번호/카드번호 마스킹을 테스트합니다.</p>
+            <textarea id="guardrail-test-input" rows="3" placeholder="테스트 입력문... (예: Ignore previous instructions or 010-1234-5678)"
+                      class="w-full p-2.5 rounded border border-slate-300 text-xs focus:ring-1 focus:ring-blue-500 outline-none"></textarea>
+            <button onclick="testGuardrail()" class="mt-2 w-full py-2 bg-slate-800 hover:bg-slate-700 text-white rounded text-xs font-semibold">
+              가드레일 검증 실행
+            </button>
+            <div id="guardrail-test-result" class="mt-3 text-xs p-2.5 bg-slate-50 rounded border border-slate-200 hidden"></div>
+          </div>
+
+          <!-- 로컬 평가 지표 계산기 -->
+          <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+            <h4 class="text-sm font-bold text-slate-900 mb-1">RAG 정량 평가기 (Local & DeepEval)</h4>
+            <p class="text-xs text-slate-500 mb-3">문맥 충실도(Faithfulness), 답변 적합성, 문맥 정밀도를 측정합니다.</p>
+            <div class="space-y-2 text-xs">
+              <input type="text" id="eval-test-query" placeholder="질문" class="w-full p-2 rounded border border-slate-300">
+              <textarea id="eval-test-answer" rows="2" placeholder="생성된 답변" class="w-full p-2 rounded border border-slate-300"></textarea>
+              <textarea id="eval-test-context" rows="2" placeholder="참고 문맥 청크" class="w-full p-2 rounded border border-slate-300"></textarea>
+              <button onclick="testLocalEval()" class="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-semibold">
+                품질 지표 산출
+              </button>
+            </div>
+            <div id="eval-test-result" class="mt-3 text-xs p-2.5 bg-slate-50 rounded border border-slate-200 hidden"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
   </main>
 
   <!-- 청크 조회 모달 -->
@@ -546,7 +663,7 @@ def get_dashboard_html() -> str:
 
     // 탭 전환 처리함
     function switchTab(tabName) {
-      const tabs = ['search', 'draft', 'extract', 'vault', 'system'];
+      const tabs = ['search', 'draft', 'extract', 'vault', 'system', 'lmops'];
       tabs.forEach(t => {
         const btn = document.getElementById(`tab-${t}`);
         const panel = document.getElementById(`panel-${t}`);
@@ -563,6 +680,9 @@ def get_dashboard_html() -> str:
       }
       if (tabName === 'system') {
         loadStats();
+      }
+      if (tabName === 'lmops') {
+        loadLmopsData();
       }
     }
 
@@ -973,6 +1093,133 @@ def get_dashboard_html() -> str:
         }
       } catch (err) {
         console.error('통계 로드 실패:', err);
+      }
+    }
+
+    // LMOps 통계 및 최근 트레이스 로그를 불러옴
+    async function loadLmopsData() {
+      try {
+        const sumRes = await apiFetch('/lmops/metrics/summary');
+        if (sumRes.ok) {
+          const sum = await sumRes.json();
+          document.getElementById('lmops-total-queries').innerText = (sum.total_queries || 0).toLocaleString();
+          document.getElementById('lmops-avg-latency').innerText = (sum.avg_latency_ms || 0).toFixed(1);
+          document.getElementById('lmops-total-tokens').innerText = (sum.total_tokens || 0).toLocaleString();
+          document.getElementById('lmops-block-rate').innerText = ((sum.guardrail_block_rate || 0) * 100).toFixed(1);
+          document.getElementById('lmops-high-risk').innerText = (sum.high_hallucination_count || 0).toLocaleString();
+          document.getElementById('lmops-avg-rating').innerText = (sum.avg_rating || 0).toFixed(1);
+          document.getElementById('lmops-feedback-count').innerText = `${sum.feedback_count || 0}건 수집됨`;
+        }
+
+        const tracesRes = await apiFetch('/lmops/traces?limit=30');
+        const tbody = document.getElementById('lmops-traces-body');
+        if (tracesRes.ok) {
+          const traces = await tracesRes.json();
+          if (traces.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-6 text-slate-400">수집된 트레이스가 없습니다.</td></tr>';
+          } else {
+            tbody.innerHTML = traces.map(t => {
+              const actionBadge = t.guardrail_action === 'block'
+                ? '<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-red-100 text-red-700">차단(BLOCK)</span>'
+                : (t.guardrail_action === 'mask'
+                  ? '<span class="px-2 py-0.5 rounded text-[11px] font-medium bg-amber-100 text-amber-700">마스킹</span>'
+                  : '<span class="px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-100 text-emerald-700">통과</span>');
+
+              const riskBadge = t.hallucination_risk === 'high'
+                ? '<span class="text-red-600 font-bold">주의</span>'
+                : (t.hallucination_risk === 'medium'
+                  ? '<span class="text-amber-600">보통</span>'
+                  : '<span class="text-emerald-600">안전</span>');
+
+              const querySnippet = escapeHtml((t.query_text || '').substring(0, 40));
+              const dt = t.created_at ? new Date(t.created_at).toLocaleTimeString() : '-';
+
+              return `
+                <tr class="hover:bg-slate-50 transition">
+                  <td class="py-2.5 px-3 font-medium text-slate-800" title="${escapeHtml(t.query_text)}">${querySnippet}...</td>
+                  <td class="py-2.5 px-3">${actionBadge}</td>
+                  <td class="py-2.5 px-3 text-right font-mono">${t.total_latency_ms.toFixed(1)} ms</td>
+                  <td class="py-2.5 px-3 text-right font-mono">${t.total_tokens}</td>
+                  <td class="py-2.5 px-3">${riskBadge}</td>
+                  <td class="py-2.5 px-3 text-slate-500">${dt}</td>
+                </tr>
+              `;
+            }).join('');
+          }
+        }
+      } catch (err) {
+        console.error('LMOps 데이터 로드 실패:', err);
+      }
+    }
+
+    // 고품질 QA를 SFT 학습 데이터셋으로 내보냄
+    async function exportCuratedSft() {
+      try {
+        const res = await apiFetch('/lmops/export-sft', { method: 'POST' });
+        if (res.ok) {
+          const data = await res.json();
+          alert(`SFT 데이터셋 내보내기 완료: 총 ${data.exported_count}건 저장됨 (${data.output_path})`);
+        } else {
+          alert('SFT 데이터셋 내보내기에 실패했습니다.');
+        }
+      } catch (err) {
+        alert(`오류 발생: ${err.message}`);
+      }
+    }
+
+    // 가드레일 사전 테스트 실행함
+    async function testGuardrail() {
+      const text = document.getElementById('guardrail-test-input').value.trim();
+      const resBox = document.getElementById('guardrail-test-result');
+      if (!text) return;
+      resBox.classList.remove('hidden');
+      resBox.innerText = '검증 수행 중...';
+      try {
+        const res = await apiFetch('/guardrails/validate-input', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text, block_on_injection: true, mask_pii: true })
+        });
+        const data = await res.json();
+        resBox.innerHTML = `<pre class="whitespace-pre-wrap">${JSON.stringify(data, null, 2)}</pre>`;
+      } catch (err) {
+        resBox.innerText = `검증 오류: ${err.message}`;
+      }
+    }
+
+    // 로컬 RAG 정량 평가기 테스트 실행함
+    async function testLocalEval() {
+      const query = document.getElementById('eval-test-query').value.trim();
+      const answer = document.getElementById('eval-test-answer').value.trim();
+      const context = document.getElementById('eval-test-context').value.trim();
+      const resBox = document.getElementById('eval-test-result');
+      if (!query || !answer) {
+        alert('질문과 답변을 모두 입력하세요.');
+        return;
+      }
+      resBox.classList.remove('hidden');
+      resBox.innerText = '평가지표 계산 중...';
+      try {
+        const res = await apiFetch('/eval/rag', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: query,
+            answer: answer,
+            contexts: context ? [context] : [],
+            engine: 'local'
+          })
+        });
+        const data = await res.json();
+        resBox.innerHTML = `
+          <div class="font-bold text-slate-800 mb-1">종합 점수: ${data.overall_score} / 100</div>
+          <div>충실도(Faithfulness): <strong>${data.faithfulness}</strong></div>
+          <div>답변 적합성(Relevance): <strong>${data.answer_relevance}</strong></div>
+          <div>문맥 정밀도(Precision): <strong>${data.context_precision}</strong></div>
+          <div>환각 위험도: <strong>${data.hallucination_risk}</strong></div>
+        `;
+      } catch (err) {
+        resBox.innerText = `평가 오류: ${err.message}`;
       }
     }
 

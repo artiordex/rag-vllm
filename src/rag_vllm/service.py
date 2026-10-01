@@ -43,6 +43,11 @@ from .standardization import (
     standardize_administrative_terms,
 )
 from .structured_quality import evaluate_structured_dataset
+from dataclasses import asdict
+from .eval.local_evaluator import LocalRagEvaluator
+from .guardrails import GuardrailAction, InputGuardrail, OutputGuardrail
+from .lmops import TraceContext, get_lmops
+from .vector_stores import get_vector_store
 
 
 def _content_hash(text: str) -> str:
@@ -415,51 +420,197 @@ def query_rag(
     if not question:
         raise ValueError("질문이 비어 있습니다.")
 
+    guardrails_enabled = (
+        options.enable_guardrails
+        if options is not None and options.enable_guardrails is not None
+        else settings.guardrails_enabled
+    )
+    store_type = (
+        options.vector_store_type
+        if options is not None and options.vector_store_type is not None
+        else settings.vector_store_type
+    )
+
+    # LMOps 생애주기 트레이스 컨텍스트 생성함
+    trace = TraceContext(
+        client_ip=client_ip,
+        query_text=question,
+        model_name=settings.llm_model or "rag-vllm-model",
+        vector_store_type=store_type,
+    )
+
+    # 1. 입력 가드레일 (탈옥, 프롬프트 인젝션, PII 검증) 수행함
+    span_guard = trace.start_span("input_guardrail")
+    input_violations: list[dict[str, Any]] = []
+    if guardrails_enabled:
+        input_guard = InputGuardrail(
+            block_on_injection=settings.guardrails_block_on_injection,
+            mask_pii=settings.guardrails_mask_pii,
+        )
+        guard_result = input_guard.validate(question)
+        trace.guardrail_action = guard_result.action.value
+        input_violations = [asdict(v) for v in guard_result.violations]
+        trace.guardrail_violations = input_violations
+        span_guard.finish({"action": guard_result.action.value, "risk_score": guard_result.risk_score})
+
+        if guard_result.action == GuardrailAction.BLOCK:
+            trace.finish()
+            if settings.lmops_enabled:
+                try:
+                    get_lmops(settings).record_trace(trace)
+                except Exception:
+                    pass
+            block_msg = guard_result.violations[0].message if guard_result.violations else "보안 위험 감지"
+            return {
+                "answer": f"[보안 가드레일에 의해 질의가 차단되었습니다] 사유: {block_msg}",
+                "context": "",
+                "llm_configured": False,
+                "confidence_score": 0.0,
+                "hallucination_risk": "high",
+                "attribution_details": {"blocked_by_guardrail": True},
+                "sources": [],
+                "trace_id": str(trace.trace_id),
+                "guardrail_action": guard_result.action.value,
+                "guardrail_violations": input_violations,
+                "evaluation": None,
+            }
+        elif guard_result.action == GuardrailAction.MASK:
+            question = guard_result.sanitized_text
+    else:
+        span_guard.finish({"skipped": True})
+
+    # 2. 임베딩 생성 스팬 수행함
+    span_embed = trace.start_span("embedding")
     embedder = get_embedder(settings)
     query_embedding = embedder.embed_query(question)
+    span_embed.finish()
 
-    filter_key = f"{document_id}:{project_name}:{department}:{max_security_level}:{min_quality_score}:{top_k}:{search_mode}"
+    filter_key = f"{document_id}:{project_name}:{department}:{max_security_level}:{min_quality_score}:{top_k}:{search_mode}:{store_type}"
     if use_llm:
         cached_result = _find_semantic_cache(query_embedding, filter_key)
         if cached_result is not None:
             return cached_result
 
-    # NOTE: 1차 후보를 넉넉히 가져와 후속 재정렬에서 정밀도를 보강함
+    # 3. 벡터 및 하이브리드 검색 스팬 수행함
+    span_retrieve = trace.start_span("retrieval", {"store_type": store_type, "search_mode": search_mode})
     candidate_k = max(15, top_k * 3)
-    if search_mode == "hybrid":
-        raw_hits = search_chunks_hybrid(
-            settings,
-            query_embedding,
-            question,
-            top_k=candidate_k,
-            document_id=document_id,
-            min_quality_score=min_quality_score,
-            project_name=project_name,
-            department=department,
-            max_security_level=max_security_level,
-        )
+    if store_type != "pgvector":
+        vstore = get_vector_store(settings, store_type)
+        if search_mode == "hybrid":
+            store_hits = vstore.search_hybrid(
+                query_vector=query_embedding,
+                query_text=question,
+                top_k=candidate_k,
+                document_id=document_id,
+                min_quality_score=min_quality_score,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+            )
+        else:
+            store_hits = vstore.search(
+                query_vector=query_embedding,
+                top_k=candidate_k,
+                document_id=document_id,
+                min_quality_score=min_quality_score,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+            )
+        raw_hits = []
+        for sh in store_hits:
+            raw_hits.append({
+                "document_id": UUID(sh["document_id"]) if isinstance(sh["document_id"], str) else sh["document_id"],
+                "source_name": sh.get("source_name", "unknown"),
+                "source_type": sh.get("source_type", "unknown"),
+                "chunk_index": sh.get("chunk_index", 0),
+                "text": sh.get("content", ""),
+                "content": sh.get("content", ""),
+                "score": sh.get("combined_score", 0.0),
+                "metadata": sh.get("metadata", {}),
+                "quality_score": sh.get("quality_score", 100),
+            })
     else:
-        raw_hits = search_chunks(
-            settings,
-            query_embedding,
-            top_k=candidate_k,
-            document_id=document_id,
-            min_quality_score=min_quality_score,
-            project_name=project_name,
-            department=department,
-            max_security_level=max_security_level,
-        )
+        if search_mode == "hybrid":
+            raw_hits = search_chunks_hybrid(
+                settings,
+                query_embedding,
+                question,
+                top_k=candidate_k,
+                document_id=document_id,
+                min_quality_score=min_quality_score,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+            )
+        else:
+            raw_hits = search_chunks(
+                settings,
+                query_embedding,
+                top_k=candidate_k,
+                document_id=document_id,
+                min_quality_score=min_quality_score,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+            )
+    span_retrieve.finish({"candidates_count": len(raw_hits)})
 
-    # NOTE: 신경망 또는 휴리스틱 리랭커를 공통 단계로 적용함
+    # 4. 신경망 또는 휴리스틱 리랭커 스팬 수행함
+    span_rerank = trace.start_span("reranking")
     reranker = get_reranker(settings)
     hits = rerank_chunks(question, raw_hits, top_k=top_k, reranker=reranker)
+    span_rerank.finish({"selected_count": len(hits)})
 
+    # 5. LLM 답변 생성 스팬 수행함
+    span_gen = trace.start_span("generation")
     context = build_context(hits)
     llm = LLMClient(settings)
     answer = llm.complete(question, context) if use_llm and hits else None
+    span_gen.finish()
 
-    # NOTE: 정밀 인용 번호와 근거 충실도를 결합한 환각 위험 진단 적용함
+    # 6. 출력 가드레일 (PII 누출 방지 및 환각 검증) 수행함
+    span_outguard = trace.start_span("output_guardrail")
+    if guardrails_enabled and answer:
+        output_guard = OutputGuardrail(mask_pii=settings.guardrails_mask_pii)
+        out_result = output_guard.validate(answer, hits)
+        if out_result.violations:
+            for v in out_result.violations:
+                input_violations.append(asdict(v))
+        if out_result.action == GuardrailAction.MASK:
+            answer = out_result.sanitized_text
+        span_outguard.finish({"action": out_result.action.value, "risk_score": out_result.risk_score})
+    else:
+        span_outguard.finish({"skipped": True})
+
+    # 7. 오프라인 정량 평가(Eval) 지표 산출함
+    span_eval = trace.start_span("evaluation")
+    evaluator = LocalRagEvaluator()
+    eval_res = evaluator.evaluate_sample(
+        query=question,
+        answer=answer or "",
+        contexts=[h.get("text", "") for h in hits],
+    )
+    span_eval.finish()
+
+    # 정밀 인용 번호와 근거 충실도 산출함
     confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(answer, hits)
+
+    # 8. 트레이스 완결 및 LMOps 영구 기록함
+    trace.answer_text = answer
+    trace.prompt_tokens = max(0, len(question) // 3 + len(context) // 3)
+    trace.completion_tokens = max(0, len(answer) // 3) if answer else 0
+    trace.total_tokens = trace.prompt_tokens + trace.completion_tokens
+    trace.faithfulness_score = eval_res.faithfulness
+    trace.answer_relevance_score = eval_res.answer_relevance
+    trace.hallucination_risk = hallucination_risk
+    trace.finish()
+
+    if settings.lmops_enabled:
+        try:
+            get_lmops(settings).record_trace(trace)
+        except Exception:
+            pass
 
     # SECURITY: 감사 로그에는 원문 대신 길이만 기록해 질의 본문 노출을 줄임
     record_audit_log(
@@ -479,6 +630,10 @@ def query_rag(
         "confidence_score": confidence_score,
         "hallucination_risk": hallucination_risk,
         "attribution_details": attribution_details,
+        "trace_id": str(trace.trace_id),
+        "guardrail_action": trace.guardrail_action,
+        "guardrail_violations": trace.guardrail_violations,
+        "evaluation": eval_res.to_dict(),
         "sources": [
             {
                 "rank": index,

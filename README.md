@@ -194,3 +194,41 @@ curl --get http://localhost:8001/api/v1/standardization/term-matches \
 ```
 
 두 응답 모두 개발/검토용 근거다. 문서 진단은 `release_eligible=false`이며 OCR·정확도·PII·저작권 또는 운영 적격을 확정하지 않는다. `term-matches`는 C-2 DB의 컬럼명만 읽으며 비정형 문서 본문을 표준화하지 않고, 후보 승인을 기록하지 않는다.
+
+## 고급 엔터프라이즈 기능 (가드레일·평가·LoRA·LMOps·다중 벡터 저장소)
+
+외부 상용 클라우드(Azure, AWS 등) 종속성을 전면 배제하고 100% 로컬 GPU 및 호스트 오프라인 환경에서 구동되는 엔터프라이즈 RAG 파이프라인을 제공한다.
+
+### 1. 보안 및 평가 가드레일 (`src/rag_vllm/guardrails.py`)
+- **입력 가드레일 (InputGuardrail)**: 시스템 프롬프트 탈취(System Prompt Leakage), 지침 무시(Instruction Override), DAN/탈옥(Jailbreak), 구분자 오염 공격을 정규식 및 휴리스틱 패턴으로 즉시 탐지하여 차단(`BLOCK`)한다.
+- **개인정보 보호**: 주민등록번호, 외국인등록번호, 휴대전화/유선전화, 이메일, 신용카드, 계좌번호를 탐지하여 안전하게 부분 마스킹(`MASK`) 처리한다.
+- **출력 가드레일 (OutputGuardrail)**: LLM 생성 답변 내 개인정보 누출 검증 및 검색된 참고 청크 대비 근거성(Faithfulness) 결여 환각 위험을 점수화하여 플래그(`FLAG`)한다.
+- **API**: `POST /guardrails/validate-input`, `POST /guardrails/validate-output`
+
+### 2. RAG 정량 평가 프레임워크 (`src/rag_vllm/eval/`)
+- **로컬 오프라인 정량 평가기 (`LocalRagEvaluator`)**: 한국어 교착어 어근 분석을 포함하여 문맥 충실도(Faithfulness), 질문-답변 적합성(Answer Relevance), 문맥 정밀도(Context Precision), 환각 위험도를 0.0~1.0 및 100점 만점으로 계산한다.
+- **로컬 vLLM DeepEval 어댑터 (`LocalVLLMDeepEvalAdapter`)**: DeepEval의 `FaithfulnessMetric`, `AnswerRelevancyMetric` 계산 시 외부 OpenAI API 대신 로컬 vLLM(`http://127.0.0.1:11435/v1`)을 LLM Judge로 활용한다.
+- **CLI 도구**: `uv run python scripts/run_eval.py --engine local --dataset data/sft/alpaca_sft_dataset.json`
+- **API**: `POST /eval/rag`
+
+### 3. SFT / LoRA 파인튜닝 파이프라인 (`src/rag_vllm/finetuning/`)
+- **PEFT LoRA 학습**: `transformers.Trainer`와 `peft.LoraConfig` 기반으로 Qwen3 및 로컬 CausalLM 모델에 대해 LoRA 어댑터(`r=16, alpha=32`)를 로컬 GPU(RTX 5060 Ti 16GB)에서 직접 파인튜닝한다.
+- **데이터셋 전처리**: Alpaca 및 Qwen ChatML 포맷 지원, 레이블 마스킹(-100)을 적용해 지침 프롬프트를 제외한 어시스턴트 생성 토큰만 역전파한다.
+- **어댑터 병합 & 서빙**: 학습된 어댑터를 베이스 모델과 영구 융합(`merge_and_unload`)하거나 vLLM 동적 LoRA 어댑터 디렉터리로 내보낸다.
+- **CLI 도구**: `uv run python scripts/train_lora.py --base-model Qwen/Qwen3-4B-Instruct-2507 --dataset data/sft/alpaca_sft_dataset.json --dry-run`
+
+### 4. 로컬 LMOps & 관측성 (`src/rag_vllm/lmops.py`)
+- **생애주기 트레이싱**: 입력 가드레일(`input_guardrail`), 임베딩(`embedding`), 검색(`retrieval`), 리랭킹(`reranking`), LLM 생성(`generation`), 출력 가드레일(`output_guardrail`), 정량 평가(`evaluation`) 단계별 세부 소요 시간(ms)과 소비 토큰을 기록한다.
+- **영구 저장 및 모니터링**: PostgreSQL `rag_lmops_traces` 및 `rag_lmops_feedback` 테이블에 저장하며, 로컬 백업용 JSONL 파일(`data/lmops_traces.jsonl`)을 병행 지원한다. 100% 로컬 환경으로 추정 비용($0.00)을 명시한다.
+- **SFT 환류 파이프라인**: 사용자 추천(Thumbs Up) 및 평점 4점 이상 또는 수정 답변이 등록된 고품질 QA를 선별하여 파인튜닝 데이터셋(`POST /lmops/export-sft`)으로 내보낸다.
+- **API**: `GET /lmops/traces`, `GET /lmops/metrics/summary`, `POST /lmops/feedback`, `POST /lmops/export-sft`
+
+### 5. 다중 벡터 저장소 추상화 인터페이스 (`src/rag_vllm/vector_stores/`)
+- **공통 인터페이스 (`BaseVectorStore`)**: 벤더 종속 없이 초기화, 문서 및 청크 임베딩 저장, 밀집(Dense) 코사인 검색, RRF 하이브리드 검색, 문서 삭제 및 상태 점검을 표준화한다.
+- **지원 엔진**:
+  - `PgVectorStore`: 기존 PostgreSQL 16 + pgvector 기반 하이브리드 FTS 검색 연동 (기본값).
+  - `QdrantVectorStore`: Qdrant 로컬 서버(`127.0.0.1:6333`) 및 프로세스 내 인메모리(`:memory:`) 모드 지원.
+  - `WeaviateVectorStore`: Weaviate 로컬 REST API(`127.0.0.1:8080`) 및 로컬 인메모리 폴백 지원.
+- **설정 변경**: `.env`의 `VECTOR_STORE_TYPE=pgvector|qdrant|weaviate`
+- **API**: `GET /vector-stores/status`
+

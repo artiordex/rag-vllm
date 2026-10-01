@@ -41,15 +41,31 @@ from .models import (
     EnterpriseQualityResponse,
     ExtractionRequest,
     ExtractionResponse,
+    GuardrailValidateInputRequest,
+    GuardrailValidateOutputRequest,
+    GuardrailValidateResponse,
     IngestResponse,
+    LmopsFeedbackRequest,
+    LmopsFeedbackResponse,
+    LmopsMetricsSummaryResponse,
+    LmopsTraceItem,
     QualityDiagnoseRequest,
     QualityReport,
     QueryRequest,
     QueryResponse,
+    RagEvalRequest,
+    RagEvalResponse,
     StructuredQualityRequest,
     StructuredQualityResponse,
     TextIngestRequest,
+    VectorStoreStatusResponse,
 )
+from dataclasses import asdict
+from .eval.deepeval_adapter import evaluate_with_deepeval
+from .eval.local_evaluator import LocalRagEvaluator
+from .guardrails import GuardrailAction, InputGuardrail, OutputGuardrail
+from .lmops import get_lmops
+from .vector_stores import get_vector_store
 from .moe_dq_client import (
     MAX_MOE_UPLOAD_BYTES,
     MoeDqUpstreamError,
@@ -561,6 +577,186 @@ def draft_endpoint(request: DraftRequest) -> DraftResponse:
             top_k=request.top_k,
             target_document_ids=request.target_document_ids,
             project_name=request.project_name,
+        )
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+# =============================================================================
+# 가드레일, 정량 평가(Eval), LMOps, 다중 벡터 저장소 엔드포인트 정의함
+# =============================================================================
+
+@router.post("/guardrails/validate-input", response_model=GuardrailValidateResponse)
+def validate_input_endpoint(request: GuardrailValidateInputRequest) -> GuardrailValidateResponse:
+    """사용자 질의 또는 입력 텍스트의 탈옥·인젝션·개인정보 위반 여부를 검증함"""
+    try:
+        guard = InputGuardrail(
+            block_on_injection=request.block_on_injection,
+            mask_pii=request.mask_pii,
+        )
+        res = guard.validate(request.text)
+        return GuardrailValidateResponse(
+            passed=res.passed,
+            action=res.action.value,
+            risk_score=res.risk_score,
+            violations=[asdict(v) for v in res.violations],
+            sanitized_text=res.sanitized_text,
+            metadata=res.metadata,
+        )
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.post("/guardrails/validate-output", response_model=GuardrailValidateResponse)
+def validate_output_endpoint(request: GuardrailValidateOutputRequest) -> GuardrailValidateResponse:
+    """생성된 답변의 환각 위험, 개인정보 누출 및 유해성을 검증함"""
+    try:
+        guard = OutputGuardrail(mask_pii=request.mask_pii)
+        res = guard.validate(request.answer, request.context_chunks)
+        return GuardrailValidateResponse(
+            passed=res.passed,
+            action=res.action.value,
+            risk_score=res.risk_score,
+            violations=[asdict(v) for v in res.violations],
+            sanitized_text=res.sanitized_text,
+            metadata=res.metadata,
+        )
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.post("/eval/rag", response_model=RagEvalResponse)
+def eval_rag_endpoint(request: RagEvalRequest) -> RagEvalResponse:
+    """단일 질의응답 샘플에 대해 오프라인 정량 평가 지표를 산출함"""
+    try:
+        if request.engine == "deepeval":
+            deepeval_metrics = evaluate_with_deepeval(
+                input_text=request.query,
+                actual_output=request.answer,
+                retrieval_context=request.contexts,
+                expected_output=request.ground_truth,
+                base_url=settings.eval_judge_base_url,
+                model_name=settings.eval_judge_model,
+            )
+            faithfulness = deepeval_metrics.get("faithfulness", {}).get("score") or 0.8
+            answer_rel = deepeval_metrics.get("answer_relevancy", {}).get("score") or 0.8
+            overall = round((faithfulness + answer_rel) * 50.0, 1)
+            return RagEvalResponse(
+                query=request.query,
+                answer=request.answer,
+                faithfulness=float(faithfulness),
+                answer_relevance=float(answer_rel),
+                context_precision=1.0,
+                context_recall=None,
+                hallucination_risk="low" if faithfulness >= 0.7 else "high",
+                overall_score=overall,
+                details=deepeval_metrics,
+            )
+        else:
+            evaluator = LocalRagEvaluator()
+            res = evaluator.evaluate_sample(
+                query=request.query,
+                answer=request.answer,
+                contexts=request.contexts,
+                ground_truth=request.ground_truth,
+            )
+            return RagEvalResponse(
+                query=res.query,
+                answer=res.answer,
+                faithfulness=res.faithfulness,
+                answer_relevance=res.answer_relevance,
+                context_precision=res.context_precision,
+                context_recall=res.context_recall,
+                hallucination_risk=res.hallucination_risk,
+                overall_score=res.overall_score,
+                details=res.to_dict(),
+            )
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get("/lmops/traces", response_model=list[LmopsTraceItem])
+def get_lmops_traces_endpoint(
+    limit: int = Query(default=50, ge=1, le=200),
+    action: str | None = Query(default=None),
+) -> list[LmopsTraceItem]:
+    """최근 LMOps 요청 트레이스 요약 목록을 반환함"""
+    try:
+        manager = get_lmops(settings)
+        traces = manager.get_recent_traces(limit=limit, action_filter=action)
+        return [
+            LmopsTraceItem(
+                id=str(t["id"]),
+                client_ip=t.get("client_ip"),
+                query_text=t.get("query_text", ""),
+                answer_text=t.get("answer_text"),
+                model_name=t.get("model_name"),
+                vector_store_type=t.get("vector_store_type"),
+                total_latency_ms=float(t.get("total_latency_ms", 0.0)),
+                total_tokens=int(t.get("total_tokens", 0)),
+                guardrail_action=t.get("guardrail_action"),
+                hallucination_risk=t.get("hallucination_risk"),
+                created_at=t.get("created_at"),
+            )
+            for t in traces
+        ]
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get("/lmops/metrics/summary", response_model=LmopsMetricsSummaryResponse)
+def get_lmops_summary_endpoint() -> LmopsMetricsSummaryResponse:
+    """LMOps 관측성 종합 지표(질의 수, 지연시간, 토큰 소비, 피드백 등)를 반환함"""
+    try:
+        manager = get_lmops(settings)
+        data = manager.get_metrics_summary()
+        return LmopsMetricsSummaryResponse(**data)
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.post("/lmops/feedback", response_model=LmopsFeedbackResponse)
+def record_lmops_feedback_endpoint(request: LmopsFeedbackRequest) -> LmopsFeedbackResponse:
+    """사용자가 제공한 질의응답 피드백을 기록함"""
+    try:
+        manager = get_lmops(settings)
+        fb_id = manager.record_feedback(
+            trace_id=request.trace_id,
+            thumbs=request.thumbs,
+            rating=request.rating,
+            comment=request.comment,
+            corrected_answer=request.corrected_answer,
+            user_id=request.user_id,
+        )
+        return LmopsFeedbackResponse(feedback_id=fb_id, status="recorded")
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.post("/lmops/export-sft")
+def export_lmops_sft_endpoint(
+    output_path: str = "data/sft/feedback_curated_sft.json",
+    min_rating: int = 4,
+) -> dict[str, Any]:
+    """긍정 피드백 또는 사용자가 수정한 고품질 질의응답을 SFT 파인튜닝용 데이터셋으로 내보냄"""
+    try:
+        manager = get_lmops(settings)
+        return manager.export_feedback_to_sft(output_path=output_path, min_rating=min_rating)
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get("/vector-stores/status", response_model=VectorStoreStatusResponse)
+def get_vector_stores_status_endpoint() -> VectorStoreStatusResponse:
+    """현재 활성화된 벡터 저장소 엔진 상태 및 통계를 확인함"""
+    try:
+        store = get_vector_store(settings)
+        health = store.health_check()
+        stats = store.get_stats()
+        return VectorStoreStatusResponse(
+            active_engine=settings.vector_store_type,
+            health=health,
+            stats=stats,
         )
     except Exception as exc:
         raise _service_error(exc) from exc

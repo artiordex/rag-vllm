@@ -77,14 +77,14 @@ def export_datasets() -> None:
         # NOTE: Alpaca JSON 배열은 일반 SFT 도구와의 호환을 위해 별도 저장함
         alpaca_path = out_dir / "alpaca_sft_dataset.json"
         alpaca_path.write_text(json.dumps(alpaca_records, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"✅ Alpaca 포맷 학습 데이터셋 저장: {alpaca_path} (총 {len(alpaca_records)}건)")
+        print(f"[성공] Alpaca 포맷 학습 데이터셋 저장: {alpaca_path} (총 {len(alpaca_records)}건)")
 
         # NOTE: ShareGPT JSONL은 대화 예시를 한 줄 단위로 처리할 수 있도록 저장함
         sharegpt_path = out_dir / "sharegpt_sft_dataset.jsonl"
         with sharegpt_path.open("w", encoding="utf-8") as f:
             for r in sharegpt_records:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"✅ ShareGPT 포맷 학습 데이터셋 저장: {sharegpt_path} (총 {len(sharegpt_records)}건)")
+        print(f"[성공] ShareGPT 포맷 학습 데이터셋 저장: {sharegpt_path} (총 {len(sharegpt_records)}건)")
 
         print("\n[LoRA 파인튜닝 가이드]")
         print("1. 생성된 데이터셋으로 Unsloth / LLaMA-Factory / PEFT를 사용하여 RTX 5060 Ti에서 LoRA 어댑터를 학습할 수 있습니다:")

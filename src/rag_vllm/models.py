@@ -105,6 +105,8 @@ class QueryOptions:
     search_mode: str = "hybrid"
     use_llm: bool = True
     client_ip: str | None = None
+    enable_guardrails: bool | None = None
+    vector_store_type: str | None = None
 
 
 class QueryRequest(BaseModel):
@@ -135,6 +137,8 @@ class QueryRequest(BaseModel):
         default="hybrid",
         description="검색 모드: 'hybrid' (하이브리드 RRF) 또는 'dense' (벡터 유사도)",
     )
+    enable_guardrails: bool | None = Field(default=None, description="가드레일 검사 활성화 여부임")
+    vector_store_type: str | None = Field(default=None, description="사용할 벡터 저장소: pgvector, qdrant, weaviate")
 
     def to_options(self, client_ip: str | None = None) -> QueryOptions:
         """QueryRequest 스키마를 내부 서비스용 QueryOptions 불변 객체로 변환함"""
@@ -148,6 +152,8 @@ class QueryRequest(BaseModel):
             search_mode=self.search_mode,
             use_llm=self.use_llm,
             client_ip=client_ip,
+            enable_guardrails=self.enable_guardrails,
+            vector_store_type=self.vector_store_type,
         )
 
 
@@ -161,6 +167,10 @@ class QueryResponse(BaseModel):
     confidence_score: float | None = Field(default=None, description="RAG 응답 신뢰도 점수 (0.0~1.0)")
     hallucination_risk: str | None = Field(default="low", description="환각 위험도: 'low', 'medium', 'high'")
     attribution_details: dict[str, Any] | None = Field(default=None, description="인용 번호 및 근거 충실도 세부 지표임")
+    trace_id: str | None = Field(default=None, description="LMOps 요청 트레이스 ID임")
+    guardrail_action: str | None = Field(default=None, description="가드레일 판정 결과: allow, mask, flag, block")
+    guardrail_violations: list[dict[str, Any]] | None = Field(default=None, description="탐지된 가드레일 위반 목록임")
+    evaluation: dict[str, Any] | None = Field(default=None, description="로컬 RAG 정량 평가 지표 결과임")
 
 
 class StructuredQualityRequest(BaseModel):
@@ -338,3 +348,116 @@ class ExtractionResponse(BaseModel):
     source_name: str
     schema_type: str
     extracted_data: dict[str, Any]
+
+
+# =============================================================================
+# 가드레일, 평가(Eval), LMOps, 벡터 저장소 연동 모델 정의함
+# =============================================================================
+
+class GuardrailValidateInputRequest(BaseModel):
+    """입력 가드레일 검증 요청 스키마임"""
+
+    text: str = Field(min_length=1, max_length=MAX_TEXT_CHARACTERS)
+    block_on_injection: bool = True
+    mask_pii: bool = True
+
+
+class GuardrailValidateOutputRequest(BaseModel):
+    """출력 가드레일 검증 요청 스키마임"""
+
+    answer: str = Field(min_length=1)
+    context_chunks: list[dict[str, Any]] | None = None
+    mask_pii: bool = True
+
+
+class GuardrailValidateResponse(BaseModel):
+    """가드레일 검증 응답 스키마임"""
+
+    passed: bool
+    action: str
+    risk_score: float
+    violations: list[dict[str, Any]]
+    sanitized_text: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RagEvalRequest(BaseModel):
+    """RAG 정량 평가 요청 스키마임"""
+
+    query: str
+    answer: str
+    contexts: list[str]
+    ground_truth: str | None = None
+    engine: str = Field(default="local", description="평가 엔진: 'local' 또는 'deepeval'")
+
+
+class RagEvalResponse(BaseModel):
+    """RAG 정량 평가 응답 스키마임"""
+
+    query: str
+    answer: str
+    faithfulness: float
+    answer_relevance: float
+    context_precision: float
+    context_recall: float | None = None
+    hallucination_risk: str
+    overall_score: float
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class LmopsFeedbackRequest(BaseModel):
+    """사용자 질의응답 피드백 제출 스키마임"""
+
+    trace_id: UUID
+    thumbs: int | None = Field(default=None, description="1(추천) 또는 -1(비추천)")
+    rating: int | None = Field(default=None, ge=1, le=5, description="1~5점 평점")
+    comment: str | None = Field(default=None, max_length=1000)
+    corrected_answer: str | None = Field(default=None, max_length=MAX_TEXT_CHARACTERS)
+    user_id: str | None = None
+
+
+class LmopsFeedbackResponse(BaseModel):
+    """피드백 저장 응답 스키마임"""
+
+    feedback_id: int
+    status: str = "recorded"
+
+
+class LmopsTraceItem(BaseModel):
+    """LMOps 트레이스 요약 아이템 스키마임"""
+
+    id: str
+    client_ip: str | None
+    query_text: str
+    answer_text: str | None
+    model_name: str | None
+    vector_store_type: str | None
+    total_latency_ms: float
+    total_tokens: int
+    guardrail_action: str | None
+    hallucination_risk: str | None
+    created_at: str | None
+
+
+class LmopsMetricsSummaryResponse(BaseModel):
+    """LMOps 관측성 종합 요약 통계 스키마임"""
+
+    total_queries: int
+    avg_latency_ms: float
+    total_tokens: int
+    estimated_cost_usd: float
+    guardrail_block_rate: float
+    high_hallucination_count: int
+    feedback_count: int
+    avg_rating: float
+    thumbs_up: int
+    thumbs_down: int
+
+
+class VectorStoreStatusResponse(BaseModel):
+    """벡터 저장소 가용성 및 통계 상태 스키마임"""
+
+    active_engine: str
+    health: bool
+    stats: dict[str, Any]
+
