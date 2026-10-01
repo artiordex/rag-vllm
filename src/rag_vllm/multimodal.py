@@ -47,48 +47,54 @@ def parse_image_document(
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             img = Image.open(BytesIO(payload))
+    except Exception as exc:
+        raise ValueError("손상되었거나 허용 범위를 넘은 이미지 파일입니다.") from exc
+
+    try:
         width, height = img.size
         if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
             raise ValueError(f"이미지 픽셀 수가 허용 한도({MAX_IMAGE_PIXELS})를 초과했습니다.")
         img.load()
         img_format = img.format or "IMAGE"
         mode = img.mode
+
+        metadata: dict[str, Any] = {
+            "width": width,
+            "height": height,
+            "format": img_format,
+            "mode": mode,
+            "is_multimodal_image": True,
+        }
+
+        # NOTE: Tesseract가 설치된 환경에서만 OCR을 시도하고 미설치도 유효한 경로로 취급함
+        ocr_text = ""
+        try:
+            import pytesseract
+
+            ocr_text = pytesseract.image_to_string(img, lang=ocr_lang).strip()
+            metadata["ocr_engine"] = "pytesseract"
+        except (ImportError, Exception):
+            metadata["ocr_engine"] = "none"
+
+        if ocr_text:
+            full_text = f"[이미지 문서 OCR 추출: {filename}]\n{ocr_text}"
+            metadata["ocr_success"] = True
+        else:
+            # NOTE: OCR이 없어도 이미지 크기·포맷을 색인해 후속 Vision LLM 연결 지점을 보존함
+            full_text = (
+                f"[멀티모달 이미지 문서: {filename}]\n"
+                f"- 규격: {width}x{height} 픽셀 ({img_format} 포맷, {mode} 모드)\n"
+                f"- 안내: 이미지 내 표 및 시각 텍스트 정밀 인식을 위해 멀티모달 Vision LLM 연결을 지원합니다."
+            )
+            metadata["ocr_success"] = False
+
+        return full_text, metadata
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
     except Exception as exc:
         raise ValueError("손상되었거나 허용 범위를 넘은 이미지 파일입니다.") from exc
-
-    metadata: dict[str, Any] = {
-        "width": width,
-        "height": height,
-        "format": img_format,
-        "mode": mode,
-        "is_multimodal_image": True,
-    }
-
-    # NOTE: Tesseract가 설치된 환경에서만 OCR을 시도하고 미설치도 유효한 경로로 취급함
-    ocr_text = ""
-    try:
-        import pytesseract
-
-        ocr_text = pytesseract.image_to_string(img, lang=ocr_lang).strip()
-        metadata["ocr_engine"] = "pytesseract"
-    except (ImportError, Exception):
-        metadata["ocr_engine"] = "none"
-
-    if ocr_text:
-        full_text = f"[이미지 문서 OCR 추출: {filename}]\n{ocr_text}"
-        metadata["ocr_success"] = True
-    else:
-        # NOTE: OCR이 없어도 이미지 크기·포맷을 색인해 후속 Vision LLM 연결 지점을 보존함
-        full_text = (
-            f"[멀티모달 이미지 문서: {filename}]\n"
-            f"- 규격: {width}x{height} 픽셀 ({img_format} 포맷, {mode} 모드)\n"
-            f"- 안내: 이미지 내 표 및 시각 텍스트 정밀 인식을 위해 멀티모달 Vision LLM 연결을 지원합니다."
-        )
-        metadata["ocr_success"] = False
-
-    return full_text, metadata
+    finally:
+        img.close()
 
 
 def encode_image_base64(payload: bytes, mime_type: str = "image/png") -> str:

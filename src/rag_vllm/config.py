@@ -80,6 +80,10 @@ class Settings:
     ingest_apply_local_term_replacements: bool
     api_key: str | None
     auto_init_db: bool
+    cors_origins: str = ""
+    database_min_pool_size: int = 1
+    database_max_pool_size: int = 10
+    database_pool_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         """인제스트나 검색을 사용할 수 없게 만드는 설정을 조기 검증함"""
@@ -116,6 +120,12 @@ class Settings:
                 raise ValueError(
                     "MOE_DQ_API_BASE_URL must be an http(s) base URL without credentials, query, or fragment"
                 )
+        if self.database_min_pool_size <= 0:
+            raise ValueError("DATABASE_MIN_POOL_SIZE must be positive")
+        if self.database_max_pool_size < self.database_min_pool_size:
+            raise ValueError("DATABASE_MAX_POOL_SIZE must be >= DATABASE_MIN_POOL_SIZE")
+        if self.database_pool_timeout <= 0:
+            raise ValueError("DATABASE_POOL_TIMEOUT must be positive")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -153,6 +163,10 @@ class Settings:
             ingest_apply_local_term_replacements=_bool_env("INGEST_APPLY_LOCAL_TERM_REPLACEMENTS", False),
             api_key=os.getenv("RAG_LAB_API_KEY") or None,
             auto_init_db=_bool_env("AUTO_INIT_DB", True),
+            cors_origins=os.getenv("RAG_CORS_ORIGINS", ""),
+            database_min_pool_size=_int_env("DATABASE_MIN_POOL_SIZE", 1),
+            database_max_pool_size=_int_env("DATABASE_MAX_POOL_SIZE", 10),
+            database_pool_timeout=_float_env("DATABASE_POOL_TIMEOUT", 30.0),
         )
 
 

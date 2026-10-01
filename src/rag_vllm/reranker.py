@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 from .config import Settings
@@ -19,6 +20,7 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 _RERANKER_INSTANCE: Any = None
+_RERANKER_LOCK = threading.Lock()
 
 
 def get_reranker(settings: Settings) -> Any:
@@ -41,15 +43,18 @@ def get_reranker(settings: Settings) -> Any:
     if _RERANKER_INSTANCE is not None:
         return _RERANKER_INSTANCE
 
-    try:
-        from FlagEmbedding import FlagReranker
+    with _RERANKER_LOCK:
+        if _RERANKER_INSTANCE is not None:
+            return _RERANKER_INSTANCE
+        try:
+            from FlagEmbedding import FlagReranker
 
-        logger.info("Initializing 2nd-stage FlagReranker: %s", reranker_model)
-        _RERANKER_INSTANCE = FlagReranker(reranker_model, use_fp16=False)
-        return _RERANKER_INSTANCE
-    except Exception as exc:
-        logger.warning("FlagReranker 로딩 실패 (어휘-휴리스틱 리랭커로 폴백): %s", exc)
-        return None
+            logger.info("Initializing 2nd-stage FlagReranker: %s", reranker_model)
+            _RERANKER_INSTANCE = FlagReranker(reranker_model, use_fp16=False)
+            return _RERANKER_INSTANCE
+        except Exception as exc:
+            logger.warning("FlagReranker 로딩 실패 (어휘-휴리스틱 리랭커로 폴백): %s", exc)
+            return None
 
 
 def rerank_chunks(

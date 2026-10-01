@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import threading
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -25,13 +27,112 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
+_POOL: Any = None
+_POOL_LOCK = threading.Lock()
+
 
 class DatabaseError(RuntimeError):
     """저장 계층이 요청을 완료하지 못했음을 나타내는 예외임"""
 
 
+class _PooledConnectionProxy:
+    """풀에서 획득한 연결의 close() 호출 시 풀로 안전하게 반환하는 프록시임"""
+
+    def __init__(self, pool: Any, conn: psycopg.Connection[Any]) -> None:
+        self._pool = pool
+        self._conn = conn
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def close(self) -> None:
+        """연결을 풀로 반환함"""
+        if not self._closed:
+            self._closed = True
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                pass
+
+    def __enter__(self) -> "_PooledConnectionProxy":
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+        return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+
+def get_db_pool(settings: Settings) -> Any:
+    """설정된 풀 크기로 ConnectionPool 인스턴스를 반환하거나 생성함"""
+    global _POOL
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                try:
+                    from psycopg_pool import ConnectionPool
+
+                    def configure_conn(conn: psycopg.Connection[Any]) -> None:
+                        try:
+                            register_vector(conn)
+                        except Exception:
+                            pass
+
+                    _POOL = ConnectionPool(
+                        settings.database_url,
+                        min_size=settings.database_min_pool_size,
+                        max_size=settings.database_max_pool_size,
+                        timeout=settings.database_pool_timeout,
+                        configure=configure_conn,
+                        kwargs={
+                            "row_factory": dict_row,
+                            "connect_timeout": settings.database_connect_timeout,
+                        },
+                        open=True,
+                    )
+                except Exception as exc:
+                    logger.warning("커넥션 풀 생성 실패, 개별 연결 모드로 동작함: %s", exc)
+                    _POOL = False
+    return _POOL
+
+
+def close_db_pool(settings: Settings | None = None) -> None:
+    """프로세스 종료 시 버퍼링된 감사 로그를 플러시하고 전역 커넥션 풀을 안전하게 닫음"""
+    if settings is not None:
+        try:
+            flush_audit_logs(settings)
+        except Exception:
+            pass
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL and _POOL is not False:
+            try:
+                _POOL.close()
+            except Exception:
+                pass
+            _POOL = None
+
+
+def get_db_pool_stats(settings: Settings) -> dict[str, int]:
+    """커넥션 풀의 연결 상태와 큐 대기 수 통계를 반환함"""
+    pool = get_db_pool(settings)
+    if pool and pool is not False:
+        try:
+            stats = pool.get_stats()
+            return {
+                "pool_min": int(stats.get("pool_min", 0)),
+                "pool_max": int(stats.get("pool_max", 0)),
+                "pool_size": int(stats.get("pool_size", 0)),
+                "pool_available": int(stats.get("pool_available", 0)),
+                "requests_waiting": int(stats.get("requests_waiting", 0)),
+            }
+        except Exception:
+            pass
+    return {"pool_min": 0, "pool_max": 0, "pool_size": 0, "pool_available": 0, "requests_waiting": 0}
+
+
 def _connect(settings: Settings, register_embedding: bool = False) -> psycopg.Connection[Any]:
-    """설정된 PostgreSQL에 dict row와 선택적 vector 타입을 연결함
+    """커넥션 풀 또는 단일 연결에서 PostgreSQL 세션을 획득함
 
     Args:
         settings: DB 주소와 연결 제한 시간을 포함한 애플리케이션 설정임
@@ -43,6 +144,19 @@ def _connect(settings: Settings, register_embedding: bool = False) -> psycopg.Co
     Raises:
         DatabaseError: 연결 또는 vector 타입 등록에 실패할 때 발생함
     """
+    pool = get_db_pool(settings)
+    if pool and pool is not False:
+        try:
+            conn = pool.getconn(timeout=settings.database_pool_timeout)
+            if register_embedding:
+                try:
+                    register_vector(conn)
+                except Exception:
+                    pass
+            return _PooledConnectionProxy(pool, conn)  # type: ignore[return-value]
+        except Exception as exc:
+            logger.warning("풀에서 연결 획득 실패, 단일 연결로 폴백함: %s", exc)
+
     try:
         connection = psycopg.connect(
             settings.database_url,
@@ -104,6 +218,22 @@ def init_db(settings: Settings) -> None:
             ON rag_documents (source_name, content_hash)
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rag_chunks_document_id
+            ON rag_chunks (document_id)
+            """
+        )
+        try:
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_rag_chunks_fts
+                ON rag_chunks USING gin (to_tsvector('simple', content))
+                """
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS rag_audit_logs (
@@ -198,6 +328,7 @@ def save_document(
     quality_report: dict[str, Any],
     chunks: list[dict[str, Any]],
     embeddings: list[list[float]],
+    replace_existing_source: bool = False,
 ) -> tuple[UUID, bool, int]:
     """문서와 모든 청크·임베딩을 하나의 트랜잭션으로 저장함
 
@@ -212,6 +343,7 @@ def save_document(
         quality_report: 저장 시점의 품질 리포트임
         chunks: 청크 본문과 원문 위치 메타데이터 목록임
         embeddings: 청크별 정규화 임베딩 목록임
+        replace_existing_source: 같은 source name의 이전 문서를 교체할지 여부임
 
     Returns:
         tuple[UUID, bool, int]: 문서 ID, 중복 여부, 저장·기존 청크 수임
@@ -240,6 +372,13 @@ def save_document(
                 ).fetchone()["count"]
                 return existing["id"], True, count
 
+            # NOTE: 프로젝트 문서 동기화는 같은 경로의 이전 버전을 남기지 않도록 교체함
+            if replace_existing_source:
+                connection.execute(
+                    "DELETE FROM rag_documents WHERE source_name = %s",
+                    (source_name,),
+                )
+
             document_id = uuid4()
             connection.execute(
                 """
@@ -258,20 +397,25 @@ def save_document(
                     Jsonb(quality_report),
                 ),
             )
-            for chunk, embedding in zip(chunks, embeddings, strict=True):
-                connection.execute(
-                    """
-                    INSERT INTO rag_chunks (document_id, chunk_index, content, metadata, embedding)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
+            if chunks:
+                chunk_params = [
                     (
                         document_id,
                         chunk["index"],
                         chunk["text"],
                         Jsonb(chunk["metadata"]),
                         Vector(embedding),
-                    ),
-                )
+                    )
+                    for chunk, embedding in zip(chunks, embeddings, strict=True)
+                ]
+                with connection.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO rag_chunks (document_id, chunk_index, content, metadata, embedding)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        chunk_params,
+                    )
             return document_id, False, len(chunks)
     except DatabaseError:
         raise
@@ -443,6 +587,42 @@ def get_system_stats(settings: Settings) -> dict[str, Any]:
         connection.close()
 
 
+_AUDIT_BUFFER: list[tuple[Any, ...]] = []
+_AUDIT_LOCK = threading.Lock()
+_AUDIT_BUFFER_MAX = 50
+
+
+def flush_audit_logs(settings: Settings) -> None:
+    """버퍼링된 감사 로그 목록을 PostgreSQL에 일괄 영속화함"""
+    global _AUDIT_BUFFER
+    logs_to_write: list[tuple[Any, ...]] = []
+    with _AUDIT_LOCK:
+        if _AUDIT_BUFFER:
+            logs_to_write = list(_AUDIT_BUFFER)
+            _AUDIT_BUFFER.clear()
+
+    if not logs_to_write:
+        return
+
+    try:
+        connection = _connect(settings)
+        try:
+            with connection.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO rag_audit_logs
+                        (query, search_mode, client_ip, hit_count, confidence_score, hallucination_risk)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    logs_to_write,
+                )
+            connection.commit()
+        finally:
+            connection.close()
+    except Exception as exc:
+        logger.warning("감사 로그 배치 영속화 실패: %s", exc)
+
+
 def record_audit_log(
     settings: Settings,
     *,
@@ -453,28 +633,21 @@ def record_audit_log(
     confidence_score: float | None = None,
     hallucination_risk: str | None = None,
 ) -> None:
-    """개인정보를 원문으로 남기지 않는 질의 식별자와 검색 결과를 기록함
+    """개인정보를 원문으로 남기지 않는 질의 식별자와 검색 결과를 버퍼에 기록함
 
     Caveats:
-        호출자가 이미 비식별화한 query를 전달해야 하며, 로그 실패는 검색 응답을
-        막지 않고 경고로 처리함
+        호출자가 이미 비식별화한 query를 전달해야 하며, 50건 누적 시 또는
+        조회·종료 시점에 데이터베이스에 일괄 반영함
     """
-    try:
-        connection = _connect(settings)
-        try:
-            connection.execute(
-                """
-                INSERT INTO rag_audit_logs
-                    (query, search_mode, client_ip, hit_count, confidence_score, hallucination_risk)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (query, search_mode, client_ip, hit_count, confidence_score, hallucination_risk),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-    except Exception as exc:
-        logger.warning("감사 로그 기록 실패: %s", exc)
+    item = (query, search_mode, client_ip, hit_count, confidence_score, hallucination_risk)
+    should_flush = False
+    with _AUDIT_LOCK:
+        _AUDIT_BUFFER.append(item)
+        if len(_AUDIT_BUFFER) >= _AUDIT_BUFFER_MAX:
+            should_flush = True
+
+    if should_flush:
+        flush_audit_logs(settings)
 
 
 def get_audit_logs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
@@ -483,6 +656,7 @@ def get_audit_logs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
     Returns:
         list[dict[str, Any]]: 외부 API에 노출 가능한 감사 로그 목록임
     """
+    flush_audit_logs(settings)
     connection = _connect(settings)
     try:
         rows = connection.execute(
@@ -523,6 +697,7 @@ def search_chunks(
     document_id: UUID | None = None,
     document_ids: list[UUID] | None = None,
     min_quality_score: int | None = None,
+    project_name: str | None = None,
     department: str | None = None,
     max_security_level: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -535,6 +710,7 @@ def search_chunks(
         document_id: 지정하면 한 문서로 검색을 제한함
         document_ids: 지정하면 허용된 문서 UUID 목록으로 검색을 제한함
         min_quality_score: 지정하면 품질 점수 이상인 문서만 사용함
+        project_name: 지정하면 해당 프로젝트 메타데이터 문서로 검색을 제한함
         department: 메타데이터 부서 필터임
         max_security_level: 허용할 최대 보안 등급임
 
@@ -555,6 +731,9 @@ def search_chunks(
     if min_quality_score is not None:
         conditions.append("COALESCE(NULLIF(d.quality_report->>'score', ''), '0')::integer >= %s")
         filter_params.append(min_quality_score)
+    if project_name is not None:
+        conditions.append("d.metadata->>'project_name' = %s")
+        filter_params.append(project_name)
     if department is not None:
         conditions.append("(c.metadata->>'department' IS NULL OR c.metadata->>'department' = %s OR c.metadata->>'department' = '전사공통')")
         filter_params.append(department)
@@ -609,6 +788,7 @@ def search_chunks_hybrid(
     document_id: UUID | None = None,
     document_ids: list[UUID] | None = None,
     min_quality_score: int | None = None,
+    project_name: str | None = None,
     department: str | None = None,
     max_security_level: int | None = None,
     rrf_k: int = 60,
@@ -630,23 +810,18 @@ def search_chunks_hybrid(
         document_id=document_id,
         document_ids=document_ids,
         min_quality_score=min_quality_score,
+        project_name=project_name,
         department=department,
         max_security_level=max_security_level,
     )
 
-    # NOTE: 짧은 핵심어를 이용해 원문 일치 후보를 보강함
+    # NOTE: 짧은 핵심어를 이용해 원문 일치 후보를 보강함 (FTS 인덱스 우선 및 ILIKE 폴백)
     keywords = [k.strip() for k in query_text.split() if len(k.strip()) >= 2]
     sparse_candidates: list[dict[str, Any]] = []
 
     if keywords:
         connection = _connect(settings)
         try:
-            kw_conditions: list[str] = []
-            kw_params: list[Any] = []
-            for kw in keywords[:5]:
-                kw_conditions.append("c.content ILIKE %s")
-                kw_params.append(f"%{kw}%")
-
             extra_conditions: list[str] = []
             extra_params: list[Any] = []
             if document_id is not None:
@@ -658,6 +833,9 @@ def search_chunks_hybrid(
             if min_quality_score is not None:
                 extra_conditions.append("COALESCE(NULLIF(d.quality_report->>'score', ''), '0')::integer >= %s")
                 extra_params.append(min_quality_score)
+            if project_name is not None:
+                extra_conditions.append("d.metadata->>'project_name' = %s")
+                extra_params.append(project_name)
             if department is not None:
                 extra_conditions.append("(c.metadata->>'department' IS NULL OR c.metadata->>'department' = %s OR c.metadata->>'department' = '전사공통')")
                 extra_params.append(department)
@@ -665,51 +843,109 @@ def search_chunks_hybrid(
                 extra_conditions.append("COALESCE(NULLIF(c.metadata->>'security_level', ''), '1')::integer <= %s")
                 extra_params.append(max_security_level)
 
-            where_parts = ["(" + " OR ".join(kw_conditions) + ")"]
+            # 1. PostgreSQL 전문 검색(FTS plainto_tsquery) 및 GIN 인덱스 활용 시도
+            fts_query_str = " ".join(keywords[:5])
+            fts_conditions = ["to_tsvector('simple', c.content) @@ plainto_tsquery('simple', %s)"]
             if extra_conditions:
-                where_parts.extend(extra_conditions)
-            where_sql = "WHERE " + " AND ".join(where_parts)
+                fts_conditions.extend(extra_conditions)
+            fts_where_sql = "WHERE " + " AND ".join(fts_conditions)
 
-            sparse_query = f"""
+            fts_sql = f"""
                 SELECT c.id, c.document_id, d.source_name, c.chunk_index, c.content,
-                       c.metadata, d.quality_report
+                       c.metadata, d.quality_report,
+                       ts_rank_cd(to_tsvector('simple', c.content), plainto_tsquery('simple', %s)) AS fts_score
                 FROM rag_chunks c
                 JOIN rag_documents d ON d.id = c.document_id
-                {where_sql}
+                {fts_where_sql}
+                ORDER BY fts_score DESC
                 LIMIT 30
             """
-            rows = connection.execute(sparse_query, [*kw_params, *extra_params]).fetchall()
-            for row in rows:
-                quality = row.get("quality_report") or {}
-                # NOTE: 키워드 포함 수를 보조 순위로만 사용함
-                text_lower = row["content"].lower()
-                match_count = sum(1 for kw in keywords if kw.lower() in text_lower)
-                sparse_candidates.append(
-                    {
-                        "id": row["id"],
-                        "document_id": row["document_id"],
-                        "source_name": row["source_name"],
-                        "chunk_index": row["chunk_index"],
-                        "text": row["content"],
-                        "metadata": row["metadata"] or {},
-                        "quality_score": quality.get("score"),
-                        "raw_matches": match_count,
-                    }
-                )
-            sparse_candidates.sort(key=lambda x: x["raw_matches"], reverse=True)
+            try:
+                fts_rows = connection.execute(fts_sql, [fts_query_str, fts_query_str, *extra_params]).fetchall()
+            except Exception:
+                fts_rows = []
+
+            if fts_rows:
+                for row in fts_rows:
+                    quality = row.get("quality_report") or {}
+                    sparse_candidates.append(
+                        {
+                            "id": row["id"],
+                            "document_id": row["document_id"],
+                            "source_name": row["source_name"],
+                            "chunk_index": row["chunk_index"],
+                            "text": row["content"],
+                            "metadata": row["metadata"] or {},
+                            "quality_score": quality.get("score"),
+                            "raw_matches": float(row.get("fts_score") or 1.0),
+                        }
+                    )
+            else:
+                # 2. FTS 결과 0건 시 기존 ILIKE 키워드 검색으로 안전하게 폴백함
+                kw_conditions: list[str] = []
+                kw_params: list[Any] = []
+                for kw in keywords[:5]:
+                    kw_conditions.append("c.content ILIKE %s")
+                    kw_params.append(f"%{kw}%")
+
+                where_parts = ["(" + " OR ".join(kw_conditions) + ")"]
+                if extra_conditions:
+                    where_parts.extend(extra_conditions)
+                where_sql = "WHERE " + " AND ".join(where_parts)
+
+                sparse_query = f"""
+                    SELECT c.id, c.document_id, d.source_name, c.chunk_index, c.content,
+                           c.metadata, d.quality_report
+                    FROM rag_chunks c
+                    JOIN rag_documents d ON d.id = c.document_id
+                    {where_sql}
+                    LIMIT 30
+                """
+                rows = connection.execute(sparse_query, [*kw_params, *extra_params]).fetchall()
+                for row in rows:
+                    quality = row.get("quality_report") or {}
+                    text_lower = row["content"].lower()
+                    match_count = sum(1 for kw in keywords if kw.lower() in text_lower)
+                    sparse_candidates.append(
+                        {
+                            "id": row["id"],
+                            "document_id": row["document_id"],
+                            "source_name": row["source_name"],
+                            "chunk_index": row["chunk_index"],
+                            "text": row["content"],
+                            "metadata": row["metadata"] or {},
+                            "quality_score": quality.get("score"),
+                            "raw_matches": float(match_count),
+                        }
+                    )
+                sparse_candidates.sort(key=lambda x: x["raw_matches"], reverse=True)
         except Exception as exc:
             logger.warning("키워드 보조 검색 실패, 벡터 검색 결과만 사용: %s", exc)
         finally:
             connection.close()
 
-    # NOTE: dense·sparse 순위를 합산해 한쪽 신호의 누락을 완화함
+    # NOTE: 질의 특성(정확 키워드/조항/코드 vs 서술형 질의)에 따라 dense·sparse 가중치를 동적으로 조절함
+    dense_weight = 1.0
+    sparse_weight = 1.0
+
+    has_exact_quote = '"' in query_text or "'" in query_text
+    has_article_no = bool(re.search(r"제[0-9]+조", query_text))
+    has_specific_code = bool(re.search(r"[A-Z0-9_-]{4,}", query_text))
+
+    if has_exact_quote or has_article_no or has_specific_code:
+        sparse_weight = 1.4
+        dense_weight = 0.8
+    elif len(keywords) >= 6:
+        dense_weight = 1.3
+        sparse_weight = 0.7
+
     all_chunks: dict[int, dict[str, Any]] = {}
     rrf_scores: dict[int, float] = {}
 
     for rank, item in enumerate(dense_candidates, start=1):
         cid = item["id"]
         all_chunks[cid] = item
-        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (dense_weight / (rrf_k + rank))
 
     for rank, item in enumerate(sparse_candidates, start=1):
         cid = item["id"]
@@ -724,7 +960,7 @@ def search_chunks_hybrid(
                 "quality_score": item["quality_score"],
                 "score": 0.5,
             }
-        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (sparse_weight / (rrf_k + rank))
 
     sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:top_k]
     final_results: list[dict[str, Any]] = []

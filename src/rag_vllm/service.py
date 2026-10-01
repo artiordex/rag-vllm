@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from typing import Any
 from uuid import UUID
 
@@ -33,6 +34,7 @@ from .db import (
 )
 from .embeddings import get_embedder
 from .llm import LLMClient
+from .models import QueryOptions
 from .quality import diagnose_text
 from .reranker import get_reranker, rerank_chunks
 from .standardization import (
@@ -75,6 +77,7 @@ def ingest_text(
     source_type: str,
     mime_type: str | None,
     metadata: dict[str, Any],
+    replace_existing_source: bool = False,
 ) -> dict[str, Any]:
     """텍스트를 정책에 따라 변환하고 청킹·임베딩 후 RAG 저장소에 등록함
 
@@ -85,6 +88,7 @@ def ingest_text(
         source_type: 입력 출처 유형임
         mime_type: 원천 MIME 유형임
         metadata: 호출자가 전달한 문서 메타데이터임
+        replace_existing_source: 같은 source name의 이전 색인을 교체할지 여부임
 
     Returns:
         dict[str, Any]: 문서 ID, 청크 수, 중복 여부, 안전한 품질 리포트임
@@ -179,7 +183,9 @@ def ingest_text(
         quality_report=quality,
         chunks=chunks,
         embeddings=embeddings,
+        replace_existing_source=replace_existing_source,
     )
+    clear_semantic_cache()
     return {
         "document_id": document_id,
         "name": name,
@@ -189,22 +195,177 @@ def ingest_text(
     }
 
 
-def build_context(hits: list[dict[str, Any]]) -> str:
+def reorder_context_u_shaped(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Lost-in-the-middle 문제를 완화하기 위해 상위 순위 청크를 프롬프트 앞뒤로 분산 배치함"""
+    if len(hits) <= 2:
+        return hits
+    reordered: list[dict[str, Any]] = []
+    left = True
+    for hit in hits:
+        if left:
+            reordered.append(hit)
+        else:
+            reordered.insert(1, hit)
+        left = not left
+    return reordered
+
+
+def build_context(hits: list[dict[str, Any]], reorder_u_shaped: bool = True) -> str:
     """검색 결과를 LLM 프롬프트에서 인용할 번호가 포함된 문맥으로 조합함"""
+    display_hits = reorder_context_u_shaped(hits) if reorder_u_shaped else hits
     return "\n\n".join(
-        f"[{index}] source={hit['source_name']} chunk={hit['chunk_index']}\n{hit['text']}"
-        for index, hit in enumerate(hits, start=1)
+        f"[{hit.get('rank', index)}] source={hit['source_name']} chunk={hit['chunk_index']}\n{hit['text']}"
+        for index, hit in enumerate(display_hits, start=1)
     )
+
+
+class _SemanticCacheEntry:
+    __slots__ = ("query", "embedding", "response", "filter_key", "timestamp")
+
+    def __init__(self, query: str, embedding: list[float], response: dict[str, Any], filter_key: str, timestamp: float) -> None:
+        self.query = query
+        self.embedding = embedding
+        self.response = response
+        self.filter_key = filter_key
+        self.timestamp = timestamp
+
+
+_SEMANTIC_CACHE: list[_SemanticCacheEntry] = []
+_MAX_SEMANTIC_CACHE = 256
+_SEMANTIC_SIMILARITY_THRESHOLD = 0.95
+_SEMANTIC_CACHE_LOCK = threading.Lock()
+
+
+def clear_semantic_cache() -> None:
+    """문서 변경 또는 수동 초기화 시 시맨틱 캐시를 비움"""
+    with _SEMANTIC_CACHE_LOCK:
+        _SEMANTIC_CACHE.clear()
+
+
+def get_semantic_cache_stats() -> dict[str, int]:
+    """시맨틱 질의 캐시의 현재 크기와 최대 용량을 반환함"""
+    with _SEMANTIC_CACHE_LOCK:
+        return {"size": len(_SEMANTIC_CACHE), "max_size": _MAX_SEMANTIC_CACHE}
+
+
+def _find_semantic_cache(query_embedding: list[float], filter_key: str) -> dict[str, Any] | None:
+    """코사인 유사도 0.95 이상인 이전 답변을 조회함"""
+    with _SEMANTIC_CACHE_LOCK:
+        # 안전한 스냅샷 순회
+        entries = list(reversed(_SEMANTIC_CACHE))
+
+    for entry in entries:
+        if entry.filter_key != filter_key:
+            continue
+        sim = sum(a * b for a, b in zip(query_embedding, entry.embedding, strict=False))
+        if sim >= _SEMANTIC_SIMILARITY_THRESHOLD:
+            return dict(entry.response)
+    return None
+
+
+def _save_semantic_cache(
+    query: str,
+    query_embedding: list[float],
+    response: dict[str, Any],
+    filter_key: str,
+) -> None:
+    """유효한 LLM 생성 답변을 시맨틱 캐시에 보관함"""
+    import time
+
+    with _SEMANTIC_CACHE_LOCK:
+        if len(_SEMANTIC_CACHE) >= _MAX_SEMANTIC_CACHE:
+            _SEMANTIC_CACHE.pop(0)
+        _SEMANTIC_CACHE.append(
+            _SemanticCacheEntry(
+                query=query,
+                embedding=query_embedding,
+                response=response,
+                filter_key=filter_key,
+                timestamp=time.time(),
+            )
+        )
+
+
+def evaluate_answer_attribution(
+    answer: str | None,
+    hits: list[dict[str, Any]],
+) -> tuple[float, str, dict[str, Any]]:
+    """생성 답변의 인용 번호 타당성과 검색 근거 충실도(Faithfulness)를 정밀 진단함
+
+    Args:
+        answer: LLM이 생성한 답변 문자열임
+        hits: 리랭킹 완료된 근거 청크 목록임
+
+    Returns:
+        tuple[float, str, dict[str, Any]]: (신뢰도 점수, 환각 위험 등급, 세부 지표)임
+    """
+    if not hits:
+        return 0.0, "high", {"valid_citations": [], "invalid_citations": [], "grounding_ratio": 0.0}
+
+    avg_search_score = sum(float(h.get("score") or h.get("rrf_score", 0.5)) for h in hits) / len(hits)
+    base_confidence = min(1.0, max(0.0, avg_search_score))
+
+    if not answer or not answer.strip():
+        return round(base_confidence, 2), "low" if base_confidence >= 0.5 else "medium", {
+            "valid_citations": [],
+            "invalid_citations": [],
+            "grounding_ratio": 0.0,
+        }
+
+    import re
+    found_citations = [int(m) for m in re.findall(r"\[([0-9]+)\]", answer)]
+    max_valid_rank = len(hits)
+    valid_citations = [c for c in found_citations if 1 <= c <= max_valid_rank]
+    invalid_citations = [c for c in found_citations if c < 1 or c > max_valid_rank]
+
+    def _extract_tokens(txt: str) -> set[str]:
+        return {t.lower() for t in re.findall(r"[가-힣a-zA-Z0-9]{2,}", txt)}
+
+    answer_tokens = _extract_tokens(answer)
+    context_tokens: set[str] = set()
+    for h in hits:
+        context_tokens.update(_extract_tokens(h.get("text", "")))
+
+    grounding_ratio = (
+        len(answer_tokens & context_tokens) / max(len(answer_tokens), 1)
+        if answer_tokens
+        else 0.0
+    )
+
+    has_valid_citations = len(valid_citations) > 0
+    has_invalid_citations = len(invalid_citations) > 0
+
+    score = (base_confidence * 0.4) + (grounding_ratio * 0.4) + (0.2 if has_valid_citations else 0.0)
+    if has_invalid_citations:
+        score = max(0.0, score - 0.25)
+
+    final_score = round(min(1.0, max(0.0, score)), 2)
+
+    if has_invalid_citations or (not has_valid_citations and grounding_ratio < 0.20) or final_score < 0.35:
+        risk = "high"
+    elif not has_valid_citations or final_score < 0.60 or grounding_ratio < 0.30:
+        risk = "medium"
+    else:
+        risk = "low"
+
+    details = {
+        "valid_citations": sorted(list(set(valid_citations))),
+        "invalid_citations": sorted(list(set(invalid_citations))),
+        "grounding_ratio": round(grounding_ratio, 2),
+    }
+    return final_score, risk, details
 
 
 def query_rag(
     settings: Settings,
     *,
     question: str,
-    top_k: int,
-    document_id: UUID | None,
-    min_quality_score: int | None,
-    use_llm: bool,
+    options: QueryOptions | None = None,
+    top_k: int = 5,
+    document_id: UUID | None = None,
+    min_quality_score: int | None = None,
+    use_llm: bool = True,
+    project_name: str | None = None,
     search_mode: str = "hybrid",
     department: str | None = None,
     max_security_level: int | None = None,
@@ -215,9 +376,11 @@ def query_rag(
     Args:
         settings: 검색·임베딩·LLM·감사 로그에 사용할 애플리케이션 설정임
         question: 검색과 답변 생성에 사용할 질문임
+        options: 캡슐화된 검색 필터 및 LLM 옵션 객체임
         top_k: 최종 근거 청크 수임
         document_id: 특정 문서로 검색 범위를 제한할 ID임
         min_quality_score: 검색 대상의 최소 품질 점수임
+        project_name: 검색 대상의 프로젝트 이름임
         use_llm: 검색 결과를 LLM 답변으로 생성할지 여부임
         search_mode: `hybrid` 또는 dense 검색 방식임
         department: 문서 부서 메타데이터 필터임
@@ -237,12 +400,29 @@ def query_rag(
         부서·보안 등급 조건은 검색 필터이며 별도의 사용자 권한 검증을 대체하지 않음
         감사 로그에는 질문 원문 대신 문자 수만 기록함
     """
+    if options is not None:
+        top_k = options.top_k
+        document_id = options.document_id
+        min_quality_score = options.min_quality_score
+        project_name = options.project_name
+        department = options.department
+        max_security_level = options.max_security_level
+        search_mode = options.search_mode
+        use_llm = options.use_llm
+        client_ip = options.client_ip
+
     question = question.strip()
     if not question:
         raise ValueError("질문이 비어 있습니다.")
 
     embedder = get_embedder(settings)
     query_embedding = embedder.embed_query(question)
+
+    filter_key = f"{document_id}:{project_name}:{department}:{max_security_level}:{min_quality_score}:{top_k}:{search_mode}"
+    if use_llm:
+        cached_result = _find_semantic_cache(query_embedding, filter_key)
+        if cached_result is not None:
+            return cached_result
 
     # NOTE: 1차 후보를 넉넉히 가져와 후속 재정렬에서 정밀도를 보강함
     candidate_k = max(15, top_k * 3)
@@ -254,6 +434,7 @@ def query_rag(
             top_k=candidate_k,
             document_id=document_id,
             min_quality_score=min_quality_score,
+            project_name=project_name,
             department=department,
             max_security_level=max_security_level,
         )
@@ -264,6 +445,7 @@ def query_rag(
             top_k=candidate_k,
             document_id=document_id,
             min_quality_score=min_quality_score,
+            project_name=project_name,
             department=department,
             max_security_level=max_security_level,
         )
@@ -276,18 +458,8 @@ def query_rag(
     llm = LLMClient(settings)
     answer = llm.complete(question, context) if use_llm and hits else None
 
-    # NOTE: 검색 점수와 인용 유무를 함께 사용해 생성 답변 위험을 보수적으로 표시함
-    confidence_score = 0.0
-    hallucination_risk = "low"
-    if hits:
-        avg_score = sum(float(h.get("score") or h.get("rrf_score", 0.5)) for h in hits) / len(hits)
-        confidence_score = round(min(1.0, max(0.0, avg_score)), 2)
-        if answer:
-            has_citations = "[" in answer and "]" in answer
-            if confidence_score < 0.35 or not has_citations:
-                hallucination_risk = "medium" if confidence_score >= 0.35 else "high"
-            else:
-                hallucination_risk = "low"
+    # NOTE: 정밀 인용 번호와 근거 충실도를 결합한 환각 위험 진단 적용함
+    confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(answer, hits)
 
     # SECURITY: 감사 로그에는 원문 대신 길이만 기록해 질의 본문 노출을 줄임
     record_audit_log(
@@ -300,12 +472,13 @@ def query_rag(
         hallucination_risk=hallucination_risk,
     )
 
-    return {
+    response_data = {
         "answer": answer,
         "context": context,
         "llm_configured": llm.configured,
         "confidence_score": confidence_score,
         "hallucination_risk": hallucination_risk,
+        "attribution_details": attribution_details,
         "sources": [
             {
                 "rank": index,
@@ -320,6 +493,136 @@ def query_rag(
             for index, hit in enumerate(hits, start=1)
         ],
     }
+
+    if use_llm and answer:
+        _save_semantic_cache(question, query_embedding, response_data, filter_key)
+
+    return response_data
+
+
+def stream_query_rag(
+    settings: Settings,
+    *,
+    question: str,
+    options: QueryOptions | None = None,
+    top_k: int = 5,
+    document_id: UUID | None = None,
+    min_quality_score: int | None = None,
+    project_name: str | None = None,
+    search_mode: str = "hybrid",
+    department: str | None = None,
+    max_security_level: int | None = None,
+    client_ip: str | None = None,
+) -> Any:
+    """검색 및 리랭킹 후 출처 메타데이터와 LLM 생성 토큰을 SSE 이벤트로 순차 스트리밍함"""
+    import json
+
+    if options is not None:
+        top_k = options.top_k
+        document_id = options.document_id
+        min_quality_score = options.min_quality_score
+        project_name = options.project_name
+        department = options.department
+        max_security_level = options.max_security_level
+        search_mode = options.search_mode
+        client_ip = options.client_ip
+
+    question = question.strip()
+    if not question:
+        yield f"data: {json.dumps({'type': 'error', 'message': '질문이 비어 있습니다.'}, ensure_ascii=False)}\n\n"
+        return
+
+    embedder = get_embedder(settings)
+    query_embedding = embedder.embed_query(question)
+
+    candidate_k = max(15, top_k * 3)
+    if search_mode == "hybrid":
+        raw_hits = search_chunks_hybrid(
+            settings,
+            query_embedding,
+            question,
+            top_k=candidate_k,
+            document_id=document_id,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+        )
+    else:
+        raw_hits = search_chunks(
+            settings,
+            query_embedding,
+            top_k=candidate_k,
+            document_id=document_id,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+        )
+
+    reranker = get_reranker(settings)
+    hits = rerank_chunks(question, raw_hits, top_k=top_k, reranker=reranker)
+
+    sources = [
+        {
+            "rank": index,
+            "document_id": str(hit["document_id"]),
+            "source_name": hit["source_name"],
+            "chunk_index": hit["chunk_index"],
+            "score": float(hit.get("score") or hit.get("rrf_score", 0.0)),
+            "text": hit["text"][:300],
+            "quality_score": hit.get("quality_score"),
+        }
+        for index, hit in enumerate(hits, start=1)
+    ]
+
+    # 1. 출처 및 근거 메타데이터 전송
+    yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
+
+    context = build_context(hits)
+    llm = LLMClient(settings)
+
+    if not hits:
+        record_audit_log(
+            settings,
+            query=f"omitted;chars:{len(question)}",
+            search_mode=search_mode,
+            client_ip=client_ip,
+            hit_count=0,
+            confidence_score=0.0,
+            hallucination_risk="high",
+        )
+        yield f"data: {json.dumps({'type': 'token', 'content': '관련 근거 문서를 찾을 수 없습니다.'}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    if not llm.configured:
+        yield f"data: {json.dumps({'type': 'token', 'content': 'LLM 설정이 완료되지 않았습니다.'}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    full_answer_parts: list[str] = []
+    for token in llm.complete_stream(question, context):
+        full_answer_parts.append(token)
+        yield f"data: {json.dumps({'type': 'token', 'content': token}, ensure_ascii=False)}\n\n"
+
+    full_answer = "".join(full_answer_parts)
+    confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(full_answer, hits)
+
+    # SECURITY: 스트리밍 질의에 대해서도 감사 로그를 동일하게 기록함
+    record_audit_log(
+        settings,
+        query=f"omitted;chars:{len(question)}",
+        search_mode=search_mode,
+        client_ip=client_ip,
+        hit_count=len(hits),
+        confidence_score=confidence_score,
+        hallucination_risk=hallucination_risk,
+    )
+
+    # 2. 최종 신뢰도 및 환각 평가 전송
+    yield f"data: {json.dumps({'type': 'attribution', 'confidence_score': confidence_score, 'hallucination_risk': hallucination_risk, 'attribution_details': attribution_details}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 def document_summary(settings: Settings, document_id: UUID) -> dict[str, Any] | None:
@@ -386,6 +689,7 @@ def draft_document(
     style: str = "공문서_개조식",
     top_k: int = 5,
     target_document_ids: list[UUID] | None = None,
+    project_name: str | None = None,
 ) -> dict[str, Any]:
     """검색 근거를 사용해 지정한 형식의 행정 문서 초안을 생성함
 
@@ -396,6 +700,7 @@ def draft_document(
         style: `DOCUMENT_STYLE_PROMPTS`에 정의된 문서 형식임
         top_k: 초안에 사용할 최종 근거 청크 수임
         target_document_ids: 검색 범위를 제한할 문서 ID 목록임
+        project_name: 검색 범위를 제한할 프로젝트 디렉터리 이름임
 
     Returns:
         dict[str, Any]: 제목, 형식, 생성 본문, 인용 근거 목록임
@@ -427,6 +732,7 @@ def draft_document(
         search_query,
         top_k=max(15, top_k * 3),
         document_ids=list(dict.fromkeys(target_document_ids)) if target_document_ids else None,
+        project_name=project_name,
     )
     hits = rerank_chunks(search_query, candidates, top_k=top_k, reranker=get_reranker(settings))
     context = build_context(hits)
@@ -671,7 +977,10 @@ def get_chunks_for_document(settings: Settings, document_id: UUID) -> list[dict[
 
 def remove_document(settings: Settings, document_id: UUID) -> bool:
     """문서와 연결된 청크를 삭제하고 삭제 여부를 반환함"""
-    return delete_document(settings, document_id)
+    deleted = delete_document(settings, document_id)
+    if deleted:
+        clear_semantic_cache()
+    return deleted
 
 
 def get_stats(settings: Settings) -> dict[str, Any]:

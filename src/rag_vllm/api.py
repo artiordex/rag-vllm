@@ -15,17 +15,20 @@ import json
 import logging
 import mimetypes
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
 from .config import get_settings
-from .db import DatabaseError, check_db, init_db
+from .db import DatabaseError, check_db, close_db_pool, init_db
 from .embeddings import EmbeddingError
-from .llm import LLMError
+from .llm import LLMError, close_shared_llm_client
+from .metrics import record_http_request, render_prometheus_metrics
 from .models import (
     AuditLogItem,
     ChunkItem,
@@ -68,6 +71,7 @@ from .service import (
     list_all_documents,
     query_rag,
     remove_document,
+    stream_query_rag,
     structured_quality_service,
 )
 
@@ -108,7 +112,7 @@ def _service_error(exc: Exception) -> HTTPException:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """애플리케이션 시작 시 설정된 경우 PostgreSQL 스키마를 초기화함
+    """애플리케이션 시작 시 PostgreSQL 스키마를 초기화하고 종료 시 커넥션 풀을 해제함
 
     Caveats:
         DB 자동 초기화 실패는 API 프로세스를 중단하지 않고 상태 확인에서
@@ -119,7 +123,11 @@ async def lifespan(_app: FastAPI):
             init_db(settings)
         except DatabaseError as exc:
             logger.warning("DB 자동 초기화를 건너뜁니다: %s", exc)
-    yield
+    try:
+        yield
+    finally:
+        close_db_pool(settings)
+        close_shared_llm_client()
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -137,7 +145,7 @@ app = FastAPI(
 # SECURITY: 브라우저 교차 출처 접근은 기본 차단하고 신뢰된 origin만 허용함
 cors_origins = [
     origin.strip()
-    for origin in os.getenv("RAG_CORS_ORIGINS", "").split(",")
+    for origin in settings.cors_origins.split(",")
     if origin.strip()
 ]
 if cors_origins:
@@ -149,7 +157,17 @@ if cors_origins:
         allow_headers=["Content-Type", "X-API-Key"],
     )
 
-from fastapi.responses import HTMLResponse
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next: Any) -> Response:
+    """모든 HTTP 요청의 상태 코드와 처리 시간을 계측하여 메트릭 레지스트리에 기록함"""
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - start_time
+    record_http_request(request.method, request.url.path, response.status_code, duration)
+    return response
+
+
 from .dashboard import get_dashboard_html
 
 router = APIRouter(dependencies=[Depends(_require_api_key)])
@@ -160,6 +178,12 @@ router = APIRouter(dependencies=[Depends(_require_api_key)])
 def dashboard_html() -> HTMLResponse:
     """내부 POC 대시보드 HTML을 인라인으로 반환함"""
     return HTMLResponse(content=get_dashboard_html(), status_code=200)
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics_endpoint() -> PlainTextResponse:
+    """Prometheus 표준 스크랩용 서비스 지표 텍스트를 반환함"""
+    return PlainTextResponse(content=render_prometheus_metrics(settings), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/health", dependencies=[Depends(_require_api_key)])
@@ -224,6 +248,7 @@ def ingest_text_endpoint(request: TextIngestRequest) -> IngestResponse:
             source_type=request.source_type,
             mime_type=request.mime_type,
             metadata=request.metadata,
+            replace_existing_source=request.replace_existing_source,
         )
     except Exception as exc:
         raise _service_error(exc) from exc
@@ -233,6 +258,7 @@ def ingest_text_endpoint(request: TextIngestRequest) -> IngestResponse:
 async def ingest_file_endpoint(
     file: UploadFile = File(...),
     metadata: str = Form(default="{}"),
+    replace_existing_source: bool = Form(default=False),
 ) -> IngestResponse:
     """업로드 파일을 크기 제한 안에서 파싱하고 RAG 저장소에 등록함
 
@@ -258,6 +284,7 @@ async def ingest_file_endpoint(
             source_type="file",
             mime_type=parsed.mime_type,
             metadata=merged_metadata,
+            replace_existing_source=replace_existing_source,
         )
     except HTTPException:
         raise
@@ -329,17 +356,33 @@ def query_endpoint(request: QueryRequest, http_request: Request) -> QueryRespons
     """
     try:
         client_ip = http_request.client.host if http_request.client else None
-        return query_rag(
+        return query_rag(settings, question=request.question, options=request.to_options(client_ip))
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.post("/query/stream")
+def query_stream_endpoint(request: QueryRequest, http_request: Request) -> StreamingResponse:
+    """질의 검색 및 vLLM 추론 토큰을 Server-Sent Events(SSE)로 실시간 스트리밍함
+
+    Caveats:
+        스트리밍 응답 중 발생하는 오류는 SSE 이벤트(type: error) 형태로 전송됨
+    """
+    try:
+        client_ip = http_request.client.host if http_request.client else None
+        stream_generator = stream_query_rag(
             settings,
             question=request.question,
-            top_k=request.top_k,
-            document_id=request.document_id,
-            min_quality_score=request.min_quality_score,
-            use_llm=request.use_llm,
-            search_mode=request.search_mode,
-            department=request.department,
-            max_security_level=request.max_security_level,
-            client_ip=client_ip,
+            options=request.to_options(client_ip),
+        )
+        return StreamingResponse(
+            stream_generator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
     except Exception as exc:
         raise _service_error(exc) from exc
@@ -517,6 +560,7 @@ def draft_endpoint(request: DraftRequest) -> DraftResponse:
             style=request.style,
             top_k=request.top_k,
             target_document_ids=request.target_document_ids,
+            project_name=request.project_name,
         )
     except Exception as exc:
         raise _service_error(exc) from exc

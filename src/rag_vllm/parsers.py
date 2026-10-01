@@ -132,10 +132,24 @@ def _parse_pdf(payload: bytes) -> ParsedDocument:
         for page_number, page in enumerate(reader.pages, start=1):
             page_text = normalize_text(page.extract_text() or "")
             if page_text:
+                pages.append(page_text)
                 extracted_characters += len(page_text)
                 if extracted_characters > MAX_TEXT_CHARACTERS:
                     raise ParseError("PDF에서 추출한 텍스트가 허용 한도를 초과했습니다.")
-                pages.append(f"[Page {page_number}]\n{page_text}")
+        is_scanned = len(pages) == 0 or (extracted_characters < 20 * len(reader.pages))
+        pdf_metadata: dict[str, object] = {
+            "page_count": len(reader.pages),
+            "is_scanned_pdf": is_scanned,
+        }
+        if is_scanned and not pages:
+            from .multimodal import extract_visual_elements_from_pdf
+
+            visual_elements = extract_visual_elements_from_pdf(payload)
+            pdf_metadata["visual_elements_count"] = len(visual_elements)
+            pages.append(
+                f"[스캔 PDF 문서: 총 {len(reader.pages)}페이지]\n"
+                "- 텍스트 레이어가 없어 OCR 또는 멀티모달 분석이 필요합니다."
+            )
     except ParseError:
         raise
     except Exception as exc:
@@ -143,7 +157,7 @@ def _parse_pdf(payload: bytes) -> ParsedDocument:
     return ParsedDocument(
         text=normalize_text("\n\n".join(pages)),
         mime_type="application/pdf",
-        metadata={"page_count": len(reader.pages)},
+        metadata=pdf_metadata,
     )
 
 
@@ -172,8 +186,17 @@ def _parse_docx(payload: bytes) -> ParsedDocument:
     table_count = 0
     for table in document.tables:
         table_count += 1
+        table_rows: list[list[str]] = []
         for row in table.rows:
-            parts.append(" | ".join(cell.text.strip() for cell in row.cells))
+            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(cells):
+                table_rows.append(cells)
+        if table_rows:
+            header = table_rows[0]
+            parts.append("| " + " | ".join(header) + " |")
+            parts.append("| " + " | ".join("---" for _ in header) + " |")
+            for r in table_rows[1:]:
+                parts.append("| " + " | ".join(r) + " |")
     return ParsedDocument(
         text=normalize_text("\n".join(parts)),
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -251,6 +274,189 @@ def _parse_hwpx(payload: bytes) -> ParsedDocument:
         raise ParseError(f"HWPX 파싱 실패: {exc}") from exc
 
 
+def _parse_xlsx(payload: bytes) -> ParsedDocument:
+    """XLSX 스프레드시트의 시트별 표 데이터를 마크다운 표로 추출함
+
+    Raises:
+        ParseError: 압축 손상, 파일 크기 한도 초과 시 발생함
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ParseError("XLSX 파싱을 위해 openpyxl을 설치해야 합니다.") from exc
+
+    try:
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            _check_archive_limits(archive)
+        wb = load_workbook(filename=BytesIO(payload), read_only=True, data_only=True)
+    except zipfile.BadZipFile as exc:
+        raise ParseError("손상되었거나 유효하지 않은 XLSX(ZIP) 파일입니다.") from exc
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"XLSX 문서를 읽을 수 없습니다: {exc}") from exc
+
+    sheets_text: list[str] = []
+    total_rows = 0
+    sheet_names = wb.sheetnames
+
+    try:
+        for sheet_name in sheet_names:
+            sheet = wb[sheet_name]
+            rows: list[list[str]] = []
+            for row in sheet.iter_rows(values_only=True):
+                cells = [str(c).strip() if c is not None else "" for c in row]
+                if any(cells):
+                    rows.append(cells)
+                    total_rows += 1
+                    if total_rows > 10_000:
+                        break
+
+            if not rows:
+                continue
+
+            sheet_lines = [f"[시트: {sheet_name}]"]
+            max_cols = max(len(r) for r in rows)
+            padded_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+
+            header = padded_rows[0]
+            sheet_lines.append("| " + " | ".join(c.replace("\n", " ") for c in header) + " |")
+            sheet_lines.append("| " + " | ".join("---" for _ in header) + " |")
+            for row in padded_rows[1:]:
+                sheet_lines.append("| " + " | ".join(c.replace("\n", " ") for c in row) + " |")
+
+            sheets_text.append("\n".join(sheet_lines))
+    finally:
+        wb.close()
+    return ParsedDocument(
+        text=normalize_text("\n\n".join(sheets_text)),
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        metadata={"sheet_count": len(sheet_names), "total_rows": total_rows},
+    )
+
+
+def _parse_csv(payload: bytes, delimiter: str = ",") -> ParsedDocument:
+    """CSV 또는 TSV 데이터를 정규화된 마크다운 표로 변환함"""
+    import csv
+
+    raw_text = _decode_bytes(payload)
+    reader = csv.reader(raw_text.splitlines(), delimiter=delimiter)
+    rows: list[list[str]] = []
+    for r in reader:
+        if any(cell.strip() for cell in r):
+            rows.append([cell.strip() for cell in r])
+            if len(rows) > 10_000:
+                break
+
+    if not rows:
+        return ParsedDocument(text="", mime_type="text/csv", metadata={"row_count": 0})
+
+    max_cols = max(len(r) for r in rows)
+    padded_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+    lines: list[str] = []
+    lines.append("| " + " | ".join(c.replace("\n", " ") for c in padded_rows[0]) + " |")
+    lines.append("| " + " | ".join("---" for _ in padded_rows[0]) + " |")
+    for row in padded_rows[1:]:
+        lines.append("| " + " | ".join(c.replace("\n", " ") for c in row) + " |")
+
+    return ParsedDocument(
+        text=normalize_text("\n".join(lines)),
+        mime_type="text/csv" if delimiter == "," else "text/tab-separated-values",
+        metadata={"row_count": len(rows), "col_count": max_cols},
+    )
+
+
+def _parse_hwp(payload: bytes) -> ParsedDocument:
+    """레거시 HWP 5.0 OLE 복합 문서에서 BodyText 섹션 텍스트를 복구 및 추출함
+
+    Raises:
+        ParseError: OLE 구조가 손상되었거나 유효하지 않은 HWP일 때 발생함
+    """
+    import re
+    import zlib
+
+    try:
+        import olefile
+    except ImportError as exc:
+        raise ParseError("HWP 파싱을 위해 olefile 라이브러리가 필요합니다.") from exc
+
+    if not olefile.isOleFile(BytesIO(payload)):
+        raise ParseError("유효한 OLE2 HWP 파일 형식이 아닙니다.")
+
+    try:
+        ole = olefile.OleFileIO(BytesIO(payload))
+    except Exception as exc:
+        raise ParseError(f"HWP OLE 파일을 열 수 없습니다: {exc}") from exc
+
+    try:
+        header_data = ole.openstream("FileHeader").read()
+        is_compressed = bool(header_data[36] & 0x01) if len(header_data) >= 37 else True
+
+        sections: list[str] = []
+        for entry in ole.listdir():
+            if len(entry) == 2 and entry[0] == "BodyText" and entry[1].startswith("Section"):
+                stream_data = ole.openstream(entry).read()
+                if is_compressed:
+                    try:
+                        decompressed = zlib.decompress(stream_data, -15)
+                    except Exception:
+                        try:
+                            decompressed = zlib.decompress(stream_data)
+                        except Exception:
+                            decompressed = stream_data
+                else:
+                    decompressed = stream_data
+
+                pos = 0
+                sec_text_parts: list[str] = []
+                while pos < len(decompressed):
+                    if pos + 4 > len(decompressed):
+                        break
+                    header = int.from_bytes(decompressed[pos : pos + 4], "little")
+                    pos += 4
+                    tag_id = header & 0x3FF
+                    size = (header >> 20) & 0xFFF
+                    if size == 0xFFF:
+                        if pos + 4 > len(decompressed):
+                            break
+                        size = int.from_bytes(decompressed[pos : pos + 4], "little")
+                        pos += 4
+
+                    if pos + size > len(decompressed):
+                        break
+
+                    record_data = decompressed[pos : pos + size]
+                    pos += size
+
+                    if tag_id == 67:  # HWPTAG_PARA_TEXT
+                        try:
+                            text_str = record_data.decode("utf-16le", errors="ignore")
+                            cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text_str)
+                            if cleaned.strip():
+                                sec_text_parts.append(cleaned.strip())
+                        except Exception:
+                            continue
+
+                if sec_text_parts:
+                    sections.append("\n".join(sec_text_parts))
+
+        full_text = normalize_text("\n\n".join(sections))
+        if not full_text:
+            raise ParseError("HWP 본문 텍스트를 추출하지 못했습니다. 손상되었거나 암호화된 문서일 수 있습니다.")
+
+        return ParsedDocument(
+            text=full_text,
+            mime_type="application/x-hwp",
+            metadata={"section_count": len(sections)},
+        )
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"HWP 파싱 실패: {exc}") from exc
+    finally:
+        ole.close()
+
+
 def parse_document(filename: str, payload: bytes, content_type: str | None = None) -> ParsedDocument:
     """지원 파일에서 텍스트를 추출하고 검색에 넣을 수 있는 형태로 반환함
 
@@ -266,8 +472,7 @@ def parse_document(filename: str, payload: bytes, content_type: str | None = Non
         ParseError: 파일 크기·형식·추출 결과가 지원 범위를 벗어날 때 발생함
 
     Caveats:
-        스캔 PDF와 레거시 HWP는 OCR 또는 전용 어댑터 없이는 조용히 잘못
-        색인하지 않도록 명시적으로 지원하지 않음
+        스캔 PDF는 OCR 또는 멀티모달 분석 대상임을 메타데이터에 명시함
     """
 
     if len(payload) > MAX_DOCUMENT_INPUT_BYTES:
@@ -282,6 +487,17 @@ def parse_document(filename: str, payload: bytes, content_type: str | None = Non
         return _with_parser_metadata(_parse_docx(payload), "docx")
     if suffix == ".hwpx" or mime_type in {"application/hwp+zip", "application/haansofthwpx"}:
         return _with_parser_metadata(_parse_hwpx(payload), "hwpx")
+    if suffix == ".hwp" or mime_type in {"application/x-hwp", "application/haansofthwp"}:
+        return _with_parser_metadata(_parse_hwp(payload), "hwp")
+    if suffix in {".xlsx", ".xlsm"} or mime_type in {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    }:
+        return _with_parser_metadata(_parse_xlsx(payload), "xlsx")
+    if suffix == ".csv" or mime_type == "text/csv":
+        return _with_parser_metadata(_parse_csv(payload, delimiter=","), "csv")
+    if suffix == ".tsv" or mime_type == "text/tab-separated-values":
+        return _with_parser_metadata(_parse_csv(payload, delimiter="\t"), "tsv")
     if suffix in {".html", ".htm"} or mime_type == "text/html":
         parser = _HTMLTextExtractor()
         parser.feed(_decode_bytes(payload))
@@ -294,8 +510,6 @@ def parse_document(filename: str, payload: bytes, content_type: str | None = Non
         except json.JSONDecodeError:
             text = raw
         return _with_parser_metadata(ParsedDocument(normalize_text(text), "application/json"), "json")
-    if suffix == ".hwp":
-        raise ParseError("레거시 바이너리 HWP 형식입니다. 공공 표준인 HWPX로 변환하여 업로드하세요.")
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
     if suffix in IMAGE_EXTENSIONS or (mime_type and mime_type.startswith("image/")):
         from .multimodal import parse_image_document

@@ -28,6 +28,10 @@ class TextIngestRequest(BaseModel):
     source_type: str = Field(default="text", max_length=64)
     mime_type: str | None = "text/plain"
     metadata: dict[str, Any] = Field(default_factory=dict)
+    replace_existing_source: bool = Field(
+        default=False,
+        description="같은 source name의 이전 색인을 새 내용으로 교체할지 여부임",
+    )
 
 
 class QualityIssue(BaseModel):
@@ -85,12 +89,35 @@ class SourceHit(BaseModel):
     quality_score: int | None = None
 
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class QueryOptions:
+    """RAG 질의 시 적용할 필터 및 검색 옵션을 캡슐화한 불변 객체임"""
+
+    top_k: int = 5
+    document_id: UUID | None = None
+    min_quality_score: int | None = None
+    project_name: str | None = None
+    department: str | None = None
+    max_security_level: int | None = None
+    search_mode: str = "hybrid"
+    use_llm: bool = True
+    client_ip: str | None = None
+
+
 class QueryRequest(BaseModel):
     """RAG 질문과 검색·보안 범위·생성 조건을 담는 요청 스키마임"""
 
     question: str = Field(min_length=1, max_length=5_000)
     top_k: int = Field(default=5, ge=1, le=50)
     document_id: UUID | None = None
+    project_name: str | None = Field(
+        default=None,
+        max_length=128,
+        description="프로젝트 문서만 검색할 때 사용하는 프로젝트 디렉터리 이름임",
+    )
     min_quality_score: int | None = Field(default=None, ge=0, le=100)
     department: str | None = Field(
         default=None,
@@ -109,6 +136,20 @@ class QueryRequest(BaseModel):
         description="검색 모드: 'hybrid' (하이브리드 RRF) 또는 'dense' (벡터 유사도)",
     )
 
+    def to_options(self, client_ip: str | None = None) -> QueryOptions:
+        """QueryRequest 스키마를 내부 서비스용 QueryOptions 불변 객체로 변환함"""
+        return QueryOptions(
+            top_k=self.top_k,
+            document_id=self.document_id,
+            min_quality_score=self.min_quality_score,
+            project_name=self.project_name,
+            department=self.department,
+            max_security_level=self.max_security_level,
+            search_mode=self.search_mode,
+            use_llm=self.use_llm,
+            client_ip=client_ip,
+        )
+
 
 class QueryResponse(BaseModel):
     """RAG 답변과 검색 문맥·근거·신뢰도 정보를 담는 응답 스키마임"""
@@ -119,6 +160,7 @@ class QueryResponse(BaseModel):
     sources: list[SourceHit]
     confidence_score: float | None = Field(default=None, description="RAG 응답 신뢰도 점수 (0.0~1.0)")
     hallucination_risk: str | None = Field(default="low", description="환각 위험도: 'low', 'medium', 'high'")
+    attribution_details: dict[str, Any] | None = Field(default=None, description="인용 번호 및 근거 충실도 세부 지표임")
 
 
 class StructuredQualityRequest(BaseModel):
@@ -258,6 +300,11 @@ class DraftRequest(BaseModel):
         description="문체 스타일: '공문서_개조식', '보고서_서술형', '요약표'",
     )
     top_k: int = Field(default=5, ge=1, le=20, description="RAG에서 검색할 참고 청크 수")
+    project_name: str | None = Field(
+        default=None,
+        max_length=128,
+        description="특정 프로젝트 문서만 참고할 때 사용하는 프로젝트 디렉터리 이름임",
+    )
     target_document_ids: list[UUID] | None = Field(
         default=None,
         max_length=50,

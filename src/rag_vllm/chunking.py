@@ -61,13 +61,42 @@ def _best_boundary(text: str, start: int, end: int) -> int:
     return end
 
 
-def chunk_text(text: str, max_chars: int = 1600, overlap: int = 240) -> list[TextChunk]:
-    """문단·문장 경계를 우선해 텍스트를 겹침 청크로 분할함
+_HEADER_PATTERN = re.compile(
+    r"(?m)^(#{1,4}\s+.+|제[0-9]+조(?:\([^\)]+\))?|[0-9]+\.\s+[^\n]{2,40}|[가-하]\.\s+[^\n]{2,40})"
+)
+
+
+def _adjust_for_table_boundary(text: str, start: int, end: int) -> int:
+    """마크다운 표 내부에서 청크 경계가 잘리지 않도록 행 경계로 보정함"""
+    if end >= len(text):
+        return len(text)
+    if text[end - 1 : end] == "\n":
+        return end
+    next_nl = text.find("\n", end)
+    prev_nl = text.rfind("\n", start, end)
+
+    line = text[prev_nl + 1 : next_nl if next_nl != -1 else len(text)].strip()
+    if line.startswith("|") and line.endswith("|"):
+        if next_nl != -1 and (next_nl - start) <= int((end - start) * 1.2):
+            return next_nl + 1
+        if prev_nl != -1 and prev_nl > start:
+            return prev_nl + 1
+    return end
+
+
+def chunk_text(
+    text: str,
+    max_chars: int = 1600,
+    overlap: int = 240,
+    inject_context_header: bool = False,
+) -> list[TextChunk]:
+    """문단·문장·표 경계를 우선해 텍스트를 겹침 청크로 분할함
 
     Args:
         text: 정규화할 원문 텍스트임
         max_chars: 청크별 최대 문자 수임
         overlap: 인접 청크가 공유할 문자 수임
+        inject_context_header: 상위 섹션 헤더를 청크 서두에 주입할지 여부임
 
     Returns:
         list[TextChunk]: 검색에 사용할 청크와 원문 위치 목록임
@@ -76,8 +105,7 @@ def chunk_text(text: str, max_chars: int = 1600, overlap: int = 240) -> list[Tex
         ValueError: 최대 크기나 겹침 범위가 유효하지 않을 때 발생함
 
     Caveats:
-        모델 토큰 수가 아닌 문자 수를 사용해 임베딩 모델을 로딩하기 전에도
-        동작하도록 구성함
+        표 데이터가 중간에 절단되지 않도록 표 행 경계를 자동 보정함
     """
 
     if max_chars <= 0:
@@ -89,23 +117,47 @@ def chunk_text(text: str, max_chars: int = 1600, overlap: int = 240) -> list[Tex
     if not normalized:
         return []
 
+    # 전체 본문에서 등장하는 헤더 위치 사전 추출
+    header_matches = list(_HEADER_PATTERN.finditer(normalized))
+
     chunks: list[TextChunk] = []
     start = 0
     index = 0
     while start < len(normalized):
         raw_end = min(start + max_chars, len(normalized))
         end = _best_boundary(normalized, start, raw_end)
+        end = _adjust_for_table_boundary(normalized, start, end)
         piece = normalized[start:end].strip()
 
         if not piece:
             start = max(end, start + 1)
             continue
 
+        # 현재 청크 시작 위치 이전의 가장 최신 헤더 추적
+        current_header: str | None = None
+        for hm in header_matches:
+            if hm.start() <= start:
+                current_header = hm.group(0).strip()
+            else:
+                break
+
         left_trim = len(normalized[start:end]) - len(normalized[start:end].lstrip())
         right_trimmed_end = end - (len(normalized[start:end]) - len(normalized[start:end].rstrip()))
         actual_start = start + left_trim
         actual_end = max(actual_start, right_trimmed_end)
-        chunks.append(TextChunk(index=index, text=piece, start=actual_start, end=actual_end))
+
+        chunk_text_value = piece
+        if inject_context_header and current_header and not piece.startswith(current_header):
+            chunk_text_value = f"[문맥: {current_header}]\n{piece}"
+
+        chunks.append(
+            TextChunk(
+                index=index,
+                text=chunk_text_value,
+                start=actual_start,
+                end=actual_end,
+            )
+        )
         index += 1
 
         if end >= len(normalized):

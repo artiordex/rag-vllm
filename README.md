@@ -65,6 +65,31 @@ docker compose --profile vllm stop vllm
 
 `EMBEDDING_PROVIDER=hash`는 연결 확인용 결정론적 임베딩으로 의미 검색에 적합하지 않다. 실제 검색에는 기본 `EMBEDDING_PROVIDER=flag`, `BAAI/bge-m3`를 사용한다. Hugging Face에서 모델을 내려받을 수 있어야 한다.
 
+## 프로젝트별 지식 등록
+
+작업공간 루트에서 아래 명령을 실행하면 새 프로젝트의 README, `docs/`, 작업 계약 문서와
+주요 빌드·배포 설정을 `project_name` 메타데이터와 함께 등록한다.
+
+```bash
+# projects 작업공간 루트에서 실행
+./bin/prj rag-sync <project-name>
+# 전체 프로젝트:
+./bin/prj rag-sync --all
+```
+
+등록 문서의 `source_name`은 `project://<project-name>/<relative-path>` 형식이며, 같은
+경로의 변경 문서는 이전 색인을 교체한다. `.env`, 소스 코드, 의존성 캐시, 빌드 산출물은
+기본 색인 대상이 아니다. 새 프로젝트를 만든 뒤 `./bin/prj workspace`와
+`./bin/prj rag-sync <project-name>`을 순서대로 실행한다.
+
+프로젝트 범위를 제한한 검색과 문서 초안은 `project_name`을 함께 보낸다.
+
+```bash
+curl -X POST http://localhost:11020/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"이 프로젝트의 실행 방법은?", "project_name":"my-project", "use_llm":true}'
+```
+
 ## API 예시
 
 텍스트 등록:
@@ -93,6 +118,20 @@ curl -X POST http://localhost:11020/documents/file \
 curl -X POST http://localhost:11020/query \
   -H 'Content-Type: application/json' \
   -d '{"question":"연차휴가 조건은 무엇인가?", "top_k": 5, "min_quality_score": 80, "use_llm": true}'
+```
+
+실시간 SSE 스트리밍 질의:
+
+```bash
+curl -N -X POST http://localhost:11020/query/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"연차휴가 발생 요건과 일수를 요약해줘", "top_k": 3, "search_mode": "hybrid"}'
+```
+
+Prometheus 서비스 메트릭 수집:
+
+```bash
+curl http://localhost:11020/metrics
 ```
 
 LLM 설정이 없거나 관련 문서가 없으면 `answer`는 `null` 또는 설명 문자열일 수 있다. 응답의 `sources`를 검토하고, 생성된 초안은 근거 문서와 대조한다.

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -32,6 +33,31 @@ def _normalize(vector: list[float]) -> list[float]:
     return [value / norm for value in vector]
 
 
+_MAX_QUERY_CACHE_SIZE = 512
+_QUERY_CACHE: dict[str, list[float]] = {}
+_CACHE_STATS: dict[str, int] = {"hits": 0, "misses": 0}
+_CACHE_LOCK = threading.Lock()
+
+
+def get_query_embedding_cache_stats() -> dict[str, int]:
+    """질의 임베딩 인메모리 캐시의 크기와 히트·미스 횟수를 반환함"""
+    with _CACHE_LOCK:
+        return {
+            "hits": _CACHE_STATS["hits"],
+            "misses": _CACHE_STATS["misses"],
+            "currsize": len(_QUERY_CACHE),
+            "maxsize": _MAX_QUERY_CACHE_SIZE,
+        }
+
+
+def clear_query_embedding_cache() -> None:
+    """질의 임베딩 캐시 및 히트 통계를 초기화함"""
+    with _CACHE_LOCK:
+        _QUERY_CACHE.clear()
+        _CACHE_STATS["hits"] = 0
+        _CACHE_STATS["misses"] = 0
+
+
 class Embedder:
     """설정에 따라 FlagEmbedding 또는 결정적 hash 임베딩을 제공함"""
 
@@ -39,6 +65,7 @@ class Embedder:
         """설정을 저장하고 무거운 임베딩 모델은 아직 로딩하지 않음"""
         self.settings = settings
         self._model: Any = None
+        self._model_lock = threading.Lock()
 
     @property
     def dimension(self) -> int:
@@ -68,25 +95,29 @@ class Embedder:
         """
         if self._model is not None:
             return self._model
-        try:
-            from FlagEmbedding import FlagAutoModel
-        except ImportError as exc:  # NOTE: 선언된 의존성이 테스트 환경에서 누락된 경우만 해당함
-            raise EmbeddingError("FlagEmbedding이 설치되어 있지 않습니다.") from exc
 
-        kwargs: dict[str, Any] = {"use_fp16": self.settings.embedding_use_fp16}
-        if self.settings.embedding_device and self.settings.embedding_device != "auto":
-            kwargs["devices"] = [self.settings.embedding_device]
-        if self.settings.embedding_model.lower().endswith("bge-m3"):
-            kwargs["model_class"] = "encoder-only-m3"
+        with self._model_lock:
+            if self._model is not None:
+                return self._model
+            try:
+                from FlagEmbedding import FlagAutoModel
+            except ImportError as exc:  # NOTE: 선언된 의존성이 테스트 환경에서 누락된 경우만 해당함
+                raise EmbeddingError("FlagEmbedding이 설치되어 있지 않습니다.") from exc
 
-        try:
-            self._model = FlagAutoModel.from_finetuned(self.settings.embedding_model, **kwargs)
-        except Exception as exc:
-            raise EmbeddingError(
-                f"임베딩 모델을 불러오지 못했습니다: {self.settings.embedding_model}. "
-                "모델 경로, Hugging Face 접근, GPU/CPU 설정을 확인하세요."
-            ) from exc
-        return self._model
+            kwargs: dict[str, Any] = {"use_fp16": self.settings.embedding_use_fp16}
+            if self.settings.embedding_device and self.settings.embedding_device != "auto":
+                kwargs["devices"] = [self.settings.embedding_device]
+            if self.settings.embedding_model.lower().endswith("bge-m3"):
+                kwargs["model_class"] = "encoder-only-m3"
+
+            try:
+                self._model = FlagAutoModel.from_finetuned(self.settings.embedding_model, **kwargs)
+            except Exception as exc:
+                raise EmbeddingError(
+                    f"임베딩 모델을 불러오지 못했습니다: {self.settings.embedding_model}. "
+                    "모델 경로, Hugging Face 접근, GPU/CPU 설정을 확인하세요."
+                ) from exc
+            return self._model
 
     @staticmethod
     def _as_lists(value: Any) -> list[list[float]]:
@@ -142,16 +173,30 @@ class Embedder:
         raise EmbeddingError(f"지원하지 않는 EMBEDDING_PROVIDER입니다: {self.settings.embedding_provider}")
 
     def embed_query(self, text: str) -> list[float]:
-        """질문 한 건을 문서 검색과 호환되는 임베딩으로 변환함
+        """질문 한 건을 문서 검색과 호환되는 임베딩으로 변환함 (인메모리 LRU 캐시 적용함)
 
         Raises:
             EmbeddingError: 설정된 임베딩 제공자를 사용할 수 없을 때 발생함
         """
+        with _CACHE_LOCK:
+            cached = _QUERY_CACHE.get(text)
+            if cached is not None:
+                _CACHE_STATS["hits"] += 1
+                return cached
+            _CACHE_STATS["misses"] += 1
+
         if self.settings.embedding_provider == "hash":
-            return self._hash_embed([text])[0]
-        if self.settings.embedding_provider == "flag":
-            return self._flag_embed([text], query=True)[0]
-        raise EmbeddingError(f"지원하지 않는 EMBEDDING_PROVIDER입니다: {self.settings.embedding_provider}")
+            vec = self._hash_embed([text])[0]
+        elif self.settings.embedding_provider == "flag":
+            vec = self._flag_embed([text], query=True)[0]
+        else:
+            raise EmbeddingError(f"지원하지 않는 EMBEDDING_PROVIDER입니다: {self.settings.embedding_provider}")
+
+        with _CACHE_LOCK:
+            if len(_QUERY_CACHE) >= _MAX_QUERY_CACHE_SIZE:
+                _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)), None)
+            _QUERY_CACHE[text] = vec
+        return vec
 
 
 @lru_cache(maxsize=4)
