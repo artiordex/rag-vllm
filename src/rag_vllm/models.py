@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .chunking import MAX_TEXT_CHARACTERS
 from .structured_quality import MAX_STRUCTURED_ROWS
@@ -94,7 +94,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class QueryOptions:
-    """RAG 질의 시 적용할 필터 및 검색 옵션을 캡슐화한 불변 객체임"""
+    """RAG 질의의 검색 필터와 캐시·가드레일 옵션을 캡슐화함"""
 
     top_k: int = 5
     document_id: UUID | None = None
@@ -107,6 +107,9 @@ class QueryOptions:
     client_ip: str | None = None
     enable_guardrails: bool | None = None
     vector_store_type: str | None = None
+    enable_semantic_cache: bool = True
+    lora_name: str | None = None
+    query_mode: Literal["auto", "retrieval", "structured_sql"] = "auto"
 
 
 class QueryRequest(BaseModel):
@@ -133,14 +136,22 @@ class QueryRequest(BaseModel):
         description="검색할 보안 등급 상한(호출자가 지정하는 필터이며 접근통제는 아님)",
     )
     use_llm: bool = True
+    query_mode: Literal["auto", "retrieval", "structured_sql"] = "auto"
     search_mode: Literal["hybrid", "dense"] = Field(
         default="hybrid",
         description="검색 모드: 'hybrid' (하이브리드 RRF) 또는 'dense' (벡터 유사도)",
     )
     enable_guardrails: bool | None = Field(default=None, description="가드레일 검사 활성화 여부임")
-    vector_store_type: Literal["pgvector", "qdrant", "weaviate"] | None = Field(
+    vector_store_type: Literal["pgvector", "qdrant", "weaviate", "cpp_engine"] | None = Field(
         default=None,
         description="VECTOR_STORE_TYPE 설정과 동일해야 하는 벡터 저장소",
+    )
+    lora_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        description="서버 허용 목록에 등록된 vLLM LoRA 어댑터 별칭",
     )
 
     def to_options(self, client_ip: str | None = None) -> QueryOptions:
@@ -154,10 +165,120 @@ class QueryRequest(BaseModel):
             max_security_level=self.max_security_level,
             search_mode=self.search_mode,
             use_llm=self.use_llm,
+            query_mode=self.query_mode,
             client_ip=client_ip,
             enable_guardrails=self.enable_guardrails,
             vector_store_type=self.vector_store_type,
+            lora_name=self.lora_name,
         )
+
+
+class ChatQueryRequest(BaseModel):
+    """앱별 검색 범위를 서버 설정에 맡기고 필요하면 LLM 답변 생성을 생략함"""
+
+    model_config = {"extra": "forbid"}
+
+    question: str = Field(min_length=1, max_length=5_000)
+    top_k: int = Field(default=5, ge=1, le=10)
+    generate_answer: bool = Field(default=True, strict=True)
+
+
+class ChatIngestRequest(BaseModel):
+    """앱 코퍼스에 승인 파생 텍스트를 등록하는 요청 스키마임"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(min_length=1, max_length=440)
+    text: str = Field(min_length=1, max_length=MAX_TEXT_CHARACTERS)
+    replace_existing_source: bool = False
+
+
+class ChatDeleteRequest(BaseModel):
+    """앱 코퍼스 안의 문서 한 건을 출처 이름으로 제거하는 요청임"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(min_length=1, max_length=440)
+
+
+class ChatIngestQualitySummary(BaseModel):
+    """앱 색인 결과에 필요한 품질 집계만 반환함"""
+
+    score: int = Field(ge=0, le=100)
+    grade: str = Field(min_length=1, max_length=64)
+    pii_detected_count: int = Field(ge=0)
+
+
+class ChatIngestResponse(BaseModel):
+    """원문 조각·품질 상세를 제외한 앱용 색인 응답임"""
+
+    document_id: UUID
+    chunk_count: int = Field(ge=0)
+    quality: ChatIngestQualitySummary
+
+
+class ChatHealthResponse(BaseModel):
+    """앱 자격증명으로 확인하는 최소 RAG 상태 응답임"""
+
+    status: Literal["ok", "degraded"]
+    database: Literal["up", "down", "not_required"]
+
+
+class ChatSourceMetadata(BaseModel):
+    """앱용 인용에는 서버가 고정한 코퍼스 이름만 포함함"""
+
+    model_config = {"extra": "forbid"}
+
+    project_name: str = Field(min_length=1, max_length=128)
+
+
+class ChatSourceHit(BaseModel):
+    """앱용 RAG 응답에서 반환하는 개인정보 마스킹·길이 제한 근거임"""
+
+    rank: int = Field(ge=1, le=10)
+    document_id: UUID
+    source_name: str = Field(min_length=1, max_length=256)
+    chunk_index: int = Field(ge=0)
+    score: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    text: str = Field(min_length=1, max_length=1_200)
+    metadata: ChatSourceMetadata
+
+
+class ChatQueryResponse(BaseModel):
+    """앱용 검색 답변 계약으로 전체 문맥과 평가 트레이스를 제외함"""
+
+    answer: str | None = Field(max_length=4_000)
+    sources: list[ChatSourceHit] = Field(max_length=10)
+    confidence_score: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    hallucination_risk: Literal["low", "medium", "high"] | None = None
+    trace_id: str | None = Field(default=None, max_length=128)
+    guardrail_action: Literal["allow", "mask", "flag", "block"] | None = None
+    query_route: Literal["retrieval", "conversation"] | None = None
+
+
+class ChatStructuredQueryRequest(BaseModel):
+    """앱의 고정 코퍼스 안에 등록된 표 문서를 질의함"""
+
+    model_config = {"extra": "forbid"}
+
+    question: str = Field(min_length=1, max_length=5_000)
+    document_id: UUID
+    table_index: int = Field(default=0, ge=0, le=100)
+
+
+class ChatStructuredQueryResponse(BaseModel):
+    """프로젝트 스코프 표 집계 결과를 반환함"""
+
+    model_config = {"extra": "forbid"}
+
+    answer: str = Field(min_length=1, max_length=4_000)
+    query_route: Literal["structured_sql"] = "structured_sql"
+    document_id: UUID
+    project_name: str = Field(min_length=1, max_length=128)
+    plan: dict[str, Any]
+    columns: list[str]
+    row_count: int = Field(ge=0)
+    results: list[dict[str, Any]] = Field(max_length=100)
 
 
 class QueryResponse(BaseModel):
@@ -174,6 +295,48 @@ class QueryResponse(BaseModel):
     guardrail_action: str | None = Field(default=None, description="가드레일 판정 결과: allow, mask, flag, block")
     guardrail_violations: list[dict[str, Any]] | None = Field(default=None, description="탐지된 가드레일 위반 목록임")
     evaluation: dict[str, Any] | None = Field(default=None, description="로컬 RAG 정량 평가 지표 결과임")
+    query_route: Literal["retrieval", "conversation", "structured_sql"] | None = None
+    query_plan: dict[str, Any] | None = None
+    retrieval_gate: dict[str, Any] | None = None
+    structured_result: dict[str, Any] | None = None
+
+
+class StructuredQueryRequest(BaseModel):
+    """지정 문서 또는 입력 표를 DuckDB 집계 경로로 질의함"""
+
+    model_config = {"extra": "forbid"}
+
+    question: str = Field(min_length=1, max_length=5_000)
+    document_id: UUID | None = None
+    csv_text: str | None = Field(default=None, max_length=MAX_TEXT_CHARACTERS)
+    csv_delimiter: Literal[",", "\t"] = ","
+    records: list[dict[str, Any]] | None = Field(default=None, max_length=MAX_STRUCTURED_ROWS)
+    table_index: int = Field(default=0, ge=0, le=100)
+    project_name: str | None = Field(default=None, max_length=128)
+    department: str | None = Field(default=None, max_length=128)
+    max_security_level: int | None = Field(default=None, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def validate_single_data_source(self) -> "StructuredQueryRequest":
+        supplied = sum(value is not None for value in (self.document_id, self.csv_text, self.records))
+        if supplied != 1:
+            raise ValueError("document_id, csv_text, records 중 정확히 하나를 지정해야 합니다.")
+        return self
+
+
+class StructuredQueryResponse(BaseModel):
+    """DuckDB 집계 계획과 결과를 반환함"""
+
+    answer: str
+    query_route: Literal["structured_sql"] = "structured_sql"
+    engine: Literal["duckdb"] = "duckdb"
+    document_id: UUID | None = None
+    source_name: str | None = None
+    plan: dict[str, Any]
+    sql: str
+    columns: list[str]
+    row_count: int = Field(ge=0)
+    results: list[dict[str, Any]] = Field(max_length=100)
 
 
 class StructuredQualityRequest(BaseModel):

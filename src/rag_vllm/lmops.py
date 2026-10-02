@@ -126,9 +126,9 @@ class TraceContext:
 class LmopsManager:
     """PostgreSQL 및 로컬 JSONL 파일에 트레이스와 사용자 피드백을 기록함"""
 
-    def __init__(self, settings: Settings, log_file: str = "data/lmops_traces.jsonl") -> None:
+    def __init__(self, settings: Settings, log_file: str | None = None) -> None:
         self.settings = settings
-        self.log_file = Path(log_file)
+        self.log_file = Path(log_file or settings.lmops_log_file)
         self._ensure_log_file()
 
     def _ensure_log_file(self) -> None:
@@ -190,19 +190,42 @@ class LmopsManager:
             """
         )
 
-    def record_trace(self, trace: TraceContext) -> None:
+    def record_trace(
+        self,
+        trace: TraceContext,
+        *,
+        store_query_text: bool | None = None,
+        store_answer_text: bool | None = None,
+    ) -> None:
         """완료된 트레이스를 데이터베이스 및 로컬 JSONL 파일에 기록함"""
         trace_data = trace.to_dict()
+        # Guardrail detections can carry the exact matched phrase and its offsets.
+        # The category and rule are enough for aggregate review; do not retain
+        # request substrings through this side channel when query text is disabled.
+        violations = trace_data.get("guardrail_violations")
+        if isinstance(violations, list):
+            safe_fields = {"rule_name", "category", "severity", "message"}
+            trace_data["guardrail_violations"] = [
+                {key: value for key, value in item.items() if key in safe_fields}
+                for item in violations
+                if isinstance(item, dict)
+            ]
+        query_text_enabled = (
+            self.settings.lmops_store_query_text if store_query_text is None else store_query_text
+        )
+        answer_text_enabled = (
+            self.settings.lmops_store_answer_text if store_answer_text is None else store_answer_text
+        )
 
         # TraceContext는 요청 원문을 포함할 수 있으므로 저장 경계에서 다시 필터링함.
         # 보관이 명시적으로 허용된 경우에도 패턴 기반 PII 마스킹을 항상 적용함.
-        if getattr(self.settings, "lmops_store_query_text", False):
+        if query_text_enabled:
             safe_query, _ = detect_and_mask_pii(trace.query_text, mask=True)
             trace_data["query_text"] = safe_query
         else:
             trace_data["query_text"] = ""
 
-        if getattr(self.settings, "lmops_store_answer_text", False) and trace.answer_text:
+        if answer_text_enabled and trace.answer_text:
             safe_answer, _ = detect_and_mask_pii(trace.answer_text, mask=True)
             trace_data["answer_text"] = safe_answer
         else:
@@ -214,6 +237,10 @@ class LmopsManager:
                 f.write(json.dumps(trace_data, ensure_ascii=False) + "\n")
         except Exception as exc:
             logger.warning("로컬 LMOps JSONL 파일 기록 실패: %s", exc)
+
+        # C++ 단독 모드에서는 JSONL을 감사 추적의 로컬 저장소로 사용하며 DB 연결을 시도하지 않음.
+        if self.settings.vector_store_type == "cpp_engine":
+            return
 
         # 2. PostgreSQL 저장함
         from .db import _connect
@@ -245,7 +272,7 @@ class LmopsManager:
                         trace.completion_tokens,
                         trace.total_tokens,
                         trace.guardrail_action,
-                        Jsonb(trace.guardrail_violations),
+                        Jsonb(trace_data["guardrail_violations"]),
                         trace.faithfulness_score,
                         trace.answer_relevance_score,
                         trace.hallucination_risk,

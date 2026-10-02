@@ -12,22 +12,31 @@
 from __future__ import annotations
 
 import hashlib
-import threading
+import json
+import logging
+import math
+import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from uuid import UUID
 
-from .chunking import MAX_TEXT_CHARACTERS, chunk_text, normalize_text
+from pydantic import BaseModel, ConfigDict, Field, create_model
+
+from .chunking import MAX_TEXT_CHARACTERS, chunk_text, chunk_text_parent_child, normalize_text
 from .config import Settings
+from .contextual_retrieval import prepare_contextual_embedding_inputs
 from .db import (
     delete_document,
     find_document_by_hash,
+    find_document_id_by_source_scope,
+    find_document_sources_by_ids,
     get_audit_logs,
     get_document,
     get_document_content,
     get_document_chunks,
     get_system_stats,
     list_documents,
-    record_audit_log,
+    record_audit_log as _db_record_audit_log,
     save_document,
     search_chunks,
     search_chunks_hybrid,
@@ -35,6 +44,26 @@ from .db import (
 from .embeddings import get_embedder
 from .llm import LLMClient
 from .models import QueryOptions
+from .query_planner import plan_subqueries
+from .retrieval_gate import evaluate_retrieval_relevance
+from .semantic_cache import (
+    clear_semantic_responses,
+    find_semantic_response,
+    save_semantic_response,
+    semantic_cache_stats,
+)
+from .structured_query import (
+    execute_structured_query,
+    is_numeric_aggregation_question,
+    is_structured_source,
+)
+from .korean_search import (
+    classify_query_route,
+    conversational_reply,
+    normalize_korean_query,
+    reciprocal_rank_fusion,
+    should_use_hyde,
+)
 from .quality import diagnose_text
 from .reranker import get_reranker, rerank_chunks
 from .standardization import (
@@ -49,10 +78,94 @@ from .guardrails import GuardrailAction, InputGuardrail, OutputGuardrail
 from .lmops import TraceContext, get_lmops
 from .vector_stores import get_vector_store
 
+logger = logging.getLogger(__name__)
+
+
+def _local_engine(settings: Settings) -> Any | None:
+    """DB 데몬 없이 동작하는 C++ 모드에서 로컬 문서 저장소를 반환함"""
+    if settings.vector_store_type == "cpp_engine":
+        return get_vector_store(settings, "cpp_engine")
+    return None
+
+
+def _find_document_by_hash(
+    settings: Settings,
+    source_name: str,
+    content_hash: str,
+    *,
+    project_name: str | None = None,
+) -> dict[str, Any] | None:
+    store = _local_engine(settings)
+    if store is not None:
+        return store.find_document_by_hash(source_name, content_hash, project_name=project_name)
+    return find_document_by_hash(settings, source_name, content_hash, project_name=project_name)
+
+
+def _get_document(settings: Settings, document_id: UUID) -> dict[str, Any] | None:
+    store = _local_engine(settings)
+    return store.get_document(document_id) if store is not None else get_document(settings, document_id)
+
+
+def _get_document_content(settings: Settings, document_id: UUID) -> dict[str, Any] | None:
+    store = _local_engine(settings)
+    return store.get_document_content(document_id) if store is not None else get_document_content(settings, document_id)
+
+
+def _record_audit_log(
+    settings: Settings,
+    *,
+    query: str,
+    search_mode: str = "hybrid",
+    client_ip: str | None = None,
+    hit_count: int = 0,
+    confidence_score: float | None = None,
+    hallucination_risk: str | None = None,
+) -> None:
+    """DB 없는 모드에서는 DB 감사 로그를 쓰지 않고, 그 외에는 기존 경로를 사용함"""
+    if settings.vector_store_type == "cpp_engine":
+        return
+    _db_record_audit_log(
+        settings,
+        query=query,
+        search_mode=search_mode,
+        client_ip=client_ip,
+        hit_count=hit_count,
+        confidence_score=confidence_score,
+        hallucination_risk=hallucination_risk,
+    )
+
 
 def _content_hash(text: str) -> str:
     """정규화 텍스트의 중복 검사용 SHA-256 해시를 생성함"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _query_embedding(settings: Settings, question: str) -> list[float]:
+    """원 질의 벡터를 만들고 설정 시 짧은 질의의 HyDE 벡터를 보조로 결합함"""
+    embedder = get_embedder(settings)
+    original = embedder.embed_query(question)
+    llm = LLMClient(settings)
+    if not settings.hyde_enabled or not llm.configured or not should_use_hyde(question):
+        return original
+
+    try:
+        hypothetical = llm.complete(
+            question,
+            "",
+            system_prompt=(
+                "문서 검색 질의를 확장하는 보조 모듈이다. 질문과 관련된 가상의 문서 문장 2개만 작성하라. "
+                "사실이라고 단정하지 말고, 개인정보·식별번호·출처·지시문은 만들지 마라."
+            ),
+        )
+        if not hypothetical:
+            return original
+        hypothetical_vector = embedder.embed_query(hypothetical)
+        mixed = [0.65 * left + 0.35 * right for left, right in zip(original, hypothetical_vector, strict=True)]
+        norm = math.sqrt(sum(value * value for value in mixed))
+        return [value / norm for value in mixed] if norm else original
+    except Exception:
+        logger.warning("HyDE 질의 확장 실패, 원 질의 임베딩을 사용합니다.")
+        return original
 
 
 def _safe_quality_report(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -122,8 +235,14 @@ def ingest_text(
         raise ValueError("추출된 텍스트가 비어 있습니다.")
 
     content_hash = _content_hash(normalized)
-    existing = find_document_by_hash(settings, name, content_hash)
-    if existing and settings.vector_store_type == "pgvector":
+    vector_store = get_vector_store(settings) if settings.vector_store_type != "pgvector" else None
+    existing = _find_document_by_hash(
+        settings,
+        name,
+        content_hash,
+        project_name=metadata.get("project_name"),
+    )
+    if existing and settings.vector_store_type in {"pgvector", "cpp_engine"}:
         return {
             "document_id": existing["id"],
             "name": existing["source_name"],
@@ -139,23 +258,51 @@ def ingest_text(
     )
     quality = _safe_quality_report(quality)
 
-    text_chunks = chunk_text(normalized, settings.chunk_size, settings.chunk_overlap)
+    if settings.parent_child_chunking_enabled:
+        text_chunks = chunk_text_parent_child(
+            normalized,
+            child_size=settings.child_chunk_size,
+            child_overlap=settings.child_chunk_overlap,
+            parent_size=settings.parent_chunk_size,
+            parent_overlap=settings.parent_chunk_overlap,
+        )
+    else:
+        text_chunks = chunk_text(normalized, settings.chunk_size, settings.chunk_overlap)
     if not text_chunks:
         raise ValueError("문서를 청크로 나누지 못했습니다.")
 
-    chunks = [
-        {
-            "index": chunk.index,
-            "text": chunk.text,
-            "metadata": {"char_start": chunk.start, "char_end": chunk.end},
-        }
-        for chunk in text_chunks
-    ]
-    # 외부 색인이 선택되면 긴 임베딩 작업 전에 연결 상태를 확인함.
-    vector_store = get_vector_store(settings) if settings.vector_store_type != "pgvector" else None
-    embeddings = get_embedder(settings).embed_documents([chunk["text"] for chunk in chunks])
+    chunks = []
+    for chunk in text_chunks:
+        chunk_metadata: dict[str, Any] = {"char_start": chunk.start, "char_end": chunk.end}
+        if chunk.parent_text is not None:
+            chunk_metadata.update({
+                "parent_chunk_index": chunk.parent_index,
+                "parent_text": chunk.parent_text,
+            })
+        chunks.append({"index": chunk.index, "text": chunk.text, "metadata": chunk_metadata})
+    contextual_title = name
+    contextual_summary = metadata.get("summary") if isinstance(metadata.get("summary"), str) else None
+    if settings.ingest_auto_mask_pii:
+        contextual_title = detect_and_mask_pii(contextual_title, mask=True)[0]
+        if contextual_summary is not None:
+            contextual_summary = detect_and_mask_pii(contextual_summary, mask=True)[0]
+    contextual_inputs = prepare_contextual_embedding_inputs(
+        chunks,
+        normalized_source_text=normalized,
+        document_title=contextual_title,
+        document_summary=contextual_summary,
+        enabled=settings.contextual_retrieval_enabled,
+    )
+    if settings.contextual_retrieval_enabled:
+        for chunk, contextual_input in zip(chunks, contextual_inputs, strict=True):
+            if contextual_input.section_path:
+                chunk["metadata"]["section_path"] = contextual_input.section_path
+                chunk["metadata"]["contextual_embedding"] = True
+    embeddings = get_embedder(settings).embed_documents(
+        [contextual_input.embedding_text for contextual_input in contextual_inputs]
+    )
     processing_metadata = {
-        "pipeline_version": "rag-vllm-ingestion-v2",
+        "pipeline_version": "rag-vllm-ingestion-v3",
         "input_content_retained_separately": False,
         "stored_content_is_derived": True,
         "stored_content_masked": bool(settings.ingest_auto_mask_pii and pii_candidates),
@@ -165,6 +312,10 @@ def ingest_text(
             *(["heuristic_pii_masking"] if settings.ingest_auto_mask_pii else []),
             *(["local_term_replacements"] if settings.ingest_apply_local_term_replacements else []),
         ],
+        "contextual_retrieval_enabled": settings.contextual_retrieval_enabled,
+        "contextual_summary_supplied": bool(
+            settings.contextual_retrieval_enabled and isinstance(metadata.get("summary"), str)
+        ),
         "pii_detection": "heuristic_pattern_match",
         "pii_candidates_detected": len(pii_candidates),
         "pii_masking_applied": bool(settings.ingest_auto_mask_pii and pii_candidates),
@@ -179,22 +330,36 @@ def ingest_text(
         "official_standardization_verified": False,
     }
     persisted_metadata = {**metadata, "rag_vllm_processing": processing_metadata}
-    # 원본 메타데이터와 문서 조회는 PostgreSQL에 유지하고, 선택된 외부 벡터 DB에도
-    # 같은 문서 ID로 색인함.
-    document_id, duplicate, chunk_count = save_document(
-        settings,
-        source_name=name,
-        source_type=source_type,
-        mime_type=mime_type,
-        content_hash=content_hash,
-        content=normalized,
-        metadata=persisted_metadata,
-        quality_report=quality,
-        chunks=chunks,
-        embeddings=embeddings,
-        replace_existing_source=replace_existing_source,
-    )
-    if vector_store is not None:
+    if settings.vector_store_type == "cpp_engine" and vector_store is not None:
+        # C++ 모드는 문서·청크·벡터를 모두 현재 프로세스 메모리에 보관해 DB 데몬을 요구하지 않음.
+        document_id, duplicate, chunk_count = vector_store.save_document(
+            source_name=name,
+            source_type=source_type,
+            mime_type=mime_type,
+            content_hash=content_hash,
+            content=normalized,
+            metadata=persisted_metadata,
+            quality_report=quality,
+            chunks=chunks,
+            embeddings=embeddings,
+            replace_existing_source=replace_existing_source,
+        )
+    else:
+        # PostgreSQL은 문서 메타데이터 기준 저장소로 두고, 외부 벡터 DB와 같은 ID로 맞춤.
+        document_id, duplicate, chunk_count = save_document(
+            settings,
+            source_name=name,
+            source_type=source_type,
+            mime_type=mime_type,
+            content_hash=content_hash,
+            content=normalized,
+            metadata=persisted_metadata,
+            quality_report=quality,
+            chunks=chunks,
+            embeddings=embeddings,
+            replace_existing_source=replace_existing_source,
+        )
+    if vector_store is not None and settings.vector_store_type != "cpp_engine":
         vector_store.save_document(
             source_name=name,
             source_type=source_type,
@@ -208,7 +373,7 @@ def ingest_text(
             document_id=document_id,
             replace_existing_source=replace_existing_source,
         )
-    clear_semantic_cache()
+    clear_semantic_cache(settings)
     return {
         "document_id": document_id,
         "name": name,
@@ -242,71 +407,63 @@ def build_context(hits: list[dict[str, Any]], reorder_u_shaped: bool = True) -> 
     )
 
 
-class _SemanticCacheEntry:
-    __slots__ = ("query", "embedding", "response", "filter_key", "timestamp")
+def _expand_parent_context(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """선택된 자식 결과를 부모 문맥으로 확장하고 중복 부모를 제거함"""
+    expanded: list[dict[str, Any]] = []
+    seen_parents: set[tuple[str, int]] = set()
+    for hit in hits:
+        metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+        parent_text = metadata.get("parent_text")
+        parent_index = metadata.get("parent_chunk_index")
+        if isinstance(parent_text, str) and isinstance(parent_index, int):
+            parent_key = (str(hit.get("document_id", "")), parent_index)
+            if parent_key in seen_parents:
+                continue
+            seen_parents.add(parent_key)
+            copied = dict(hit)
+            copied["child_text"] = hit.get("text", "")
+            copied["text"] = parent_text
+            copied["content"] = parent_text
+            expanded.append(copied)
+        else:
+            expanded.append(hit)
+    return expanded
 
-    def __init__(self, query: str, embedding: list[float], response: dict[str, Any], filter_key: str, timestamp: float) -> None:
-        self.query = query
-        self.embedding = embedding
-        self.response = response
-        self.filter_key = filter_key
-        self.timestamp = timestamp
+
+def _source_metadata_without_parent_text(value: Any) -> dict[str, Any]:
+    """프롬프트 확장용 부모 원문을 출처 메타데이터 응답에서 제외함"""
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if key != "parent_text"}
 
 
-_SEMANTIC_CACHE: list[_SemanticCacheEntry] = []
-_MAX_SEMANTIC_CACHE = 256
-_SEMANTIC_SIMILARITY_THRESHOLD = 0.95
-_SEMANTIC_CACHE_LOCK = threading.Lock()
-
-
-def clear_semantic_cache() -> None:
-    """문서 변경 또는 수동 초기화 시 시맨틱 캐시를 비움"""
-    with _SEMANTIC_CACHE_LOCK:
-        _SEMANTIC_CACHE.clear()
+def clear_semantic_cache(settings: Settings | None = None) -> None:
+    """문서 변경 또는 수동 초기화 시 로컬·Redis 시맨틱 캐시를 비움"""
+    clear_semantic_responses(settings)
 
 
 def get_semantic_cache_stats() -> dict[str, int]:
-    """시맨틱 질의 캐시의 현재 크기와 최대 용량을 반환함"""
-    with _SEMANTIC_CACHE_LOCK:
-        return {"size": len(_SEMANTIC_CACHE), "max_size": _MAX_SEMANTIC_CACHE}
+    """현재 프로세스의 시맨틱 캐시 수와 구성 한도를 반환함"""
+    return semantic_cache_stats()
 
 
-def _find_semantic_cache(query_embedding: list[float], filter_key: str) -> dict[str, Any] | None:
-    """코사인 유사도 0.95 이상인 이전 답변을 조회함"""
-    with _SEMANTIC_CACHE_LOCK:
-        # 안전한 스냅샷 순회
-        entries = list(reversed(_SEMANTIC_CACHE))
-
-    for entry in entries:
-        if entry.filter_key != filter_key:
-            continue
-        sim = sum(a * b for a, b in zip(query_embedding, entry.embedding, strict=False))
-        if sim >= _SEMANTIC_SIMILARITY_THRESHOLD:
-            return dict(entry.response)
-    return None
+def _find_semantic_cache(
+    settings: Settings,
+    query_embedding: list[float],
+    filter_key: str,
+) -> dict[str, Any] | None:
+    """검색 범위가 일치하는 의미 캐시 답변을 조회함"""
+    return find_semantic_response(settings, query_embedding, filter_key)
 
 
 def _save_semantic_cache(
-    query: str,
+    settings: Settings,
     query_embedding: list[float],
     response: dict[str, Any],
     filter_key: str,
 ) -> None:
-    """유효한 LLM 생성 답변을 시맨틱 캐시에 보관함"""
-    import time
-
-    with _SEMANTIC_CACHE_LOCK:
-        if len(_SEMANTIC_CACHE) >= _MAX_SEMANTIC_CACHE:
-            _SEMANTIC_CACHE.pop(0)
-        _SEMANTIC_CACHE.append(
-            _SemanticCacheEntry(
-                query=query,
-                embedding=query_embedding,
-                response=response,
-                filter_key=filter_key,
-                timestamp=time.time(),
-            )
-        )
+    """생성 답변을 설정된 TTL과 용량 한도에 따라 저장함"""
+    save_semantic_response(settings, query_embedding, response, filter_key)
 
 
 def _retrieve_candidates(
@@ -366,22 +523,43 @@ def _retrieve_candidates(
     if search_mode == "hybrid":
         kwargs["query_text"] = query_text
     store_hits = search(**kwargs)
-    results: list[dict[str, Any]] = []
+    parsed_hits: list[tuple[UUID, dict[str, Any]]] = []
     for hit in store_hits:
-        hit_document_id = hit.get("document_id")
         try:
-            parsed_document_id = UUID(str(hit_document_id))
+            parsed_document_id = UUID(str(hit.get("document_id")))
         except (TypeError, ValueError, AttributeError):
             continue
+        parsed_hits.append((parsed_document_id, hit))
+
+    requested_ids = list(dict.fromkeys(document_id for document_id, _ in parsed_hits))
+    if vector_store_type == "cpp_engine":
+        active_sources = store.get_document_sources_by_ids(requested_ids, project_name=project_name)
+    else:
+        # 외부 저장소의 orphan 벡터는 PostgreSQL의 현재 문서 ID와 프로젝트 범위를
+        # 대조해 제거함. C++ 모드는 메타데이터도 같은 로컬 저장소가 소유함.
+        active_sources = find_document_sources_by_ids(
+            settings,
+            requested_ids,
+            project_name=project_name,
+        )
+    results: list[dict[str, Any]] = []
+    for parsed_document_id, hit in parsed_hits:
+        source_name = active_sources.get(parsed_document_id)
+        if source_name is None:
+            continue
+        hit_metadata = hit.get("metadata")
+        metadata = dict(hit_metadata) if isinstance(hit_metadata, dict) else {}
+        if project_name is not None:
+            metadata["project_name"] = project_name
         results.append({
             "document_id": parsed_document_id,
-            "source_name": hit.get("source_name") or "unknown",
+            "source_name": source_name,
             "source_type": hit.get("source_type") or "unknown",
             "chunk_index": hit.get("chunk_index", 0),
             "text": hit.get("content", "") or "",
             "content": hit.get("content", "") or "",
             "score": hit.get("combined_score", 0.0),
-            "metadata": hit.get("metadata", {}),
+            "metadata": metadata,
             "quality_score": hit.get("quality_score", 100),
         })
     return results
@@ -511,6 +689,11 @@ def query_rag(
         search_mode = options.search_mode
         use_llm = options.use_llm
         client_ip = options.client_ip
+        lora_name = options.lora_name
+        query_mode = options.query_mode
+    else:
+        lora_name = None
+        query_mode = "auto"
 
     question = question.strip()
     if not question:
@@ -521,6 +704,7 @@ def query_rag(
         if options is not None and options.enable_guardrails is not None
         else settings.guardrails_enabled
     )
+    semantic_cache_enabled = options.enable_semantic_cache if options is not None else True
     if (
         options is not None
         and options.vector_store_type is not None
@@ -530,6 +714,8 @@ def query_rag(
             "질의 시 벡터 저장소를 바꿀 수 없습니다. 인제스트에 사용한 VECTOR_STORE_TYPE과 같아야 합니다."
         )
     store_type = settings.vector_store_type
+    if lora_name is not None and lora_name not in dict(settings.llm_lora_adapters):
+        raise ValueError("요청한 LoRA 별칭이 서버 허용 목록에 없습니다.")
 
     # LMOps 생애주기 트레이스 컨텍스트 생성함
     trace = TraceContext(
@@ -557,7 +743,11 @@ def query_rag(
             trace.finish()
             if settings.lmops_enabled:
                 try:
-                    get_lmops(settings).record_trace(trace)
+                    get_lmops(settings).record_trace(
+                        trace,
+                        store_query_text=settings.lmops_store_query_text,
+                        store_answer_text=settings.lmops_store_answer_text,
+                    )
                 except Exception:
                     pass
             block_msg = guard_result.violations[0].message if guard_result.violations else "보안 위험 감지"
@@ -579,52 +769,254 @@ def query_rag(
     else:
         span_guard.finish({"skipped": True})
 
+    structured_route = query_mode == "structured_sql"
+    if query_mode == "auto" and settings.structured_query_enabled and document_id is not None and is_numeric_aggregation_question(question):
+        document = _get_document(settings, document_id)
+        if document is not None and is_structured_source(
+            str(document.get("source_name") or ""),
+            document.get("mime_type"),
+        ):
+            structured_route = True
+    if structured_route:
+        if document_id is None:
+            raise ValueError("자동 구조 질의에는 document_id가 필요합니다. CSV 본문은 /query/structured를 사용하세요.")
+        if not settings.structured_query_enabled:
+            raise ValueError("STRUCTURED_QUERY_ENABLED 설정이 비활성화되어 있습니다.")
+        structured_result = query_structured_data(
+            settings,
+            question=question,
+            document_id=document_id,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+            client_ip=client_ip,
+            use_llm_for_planning=use_llm,
+        )
+        answer = structured_result["answer"]
+        trace.answer_text = answer
+        trace.prompt_tokens = max(0, len(question) // 3)
+        trace.completion_tokens = max(0, len(answer) // 3)
+        trace.total_tokens = trace.prompt_tokens + trace.completion_tokens
+        trace.finish()
+        if settings.lmops_enabled:
+            try:
+                get_lmops(settings).record_trace(
+                    trace,
+                    store_query_text=settings.lmops_store_query_text,
+                    store_answer_text=settings.lmops_store_answer_text,
+                )
+            except Exception:
+                pass
+        return {
+            "answer": answer,
+            "context": "",
+            "llm_configured": bool(use_llm and LLMClient(settings).configured),
+            "confidence_score": None,
+            "hallucination_risk": None,
+            "attribution_details": {
+                "method": "duckdb_aggregate",
+                "document_id": str(document_id),
+                "result_rows": len(structured_result["results"]),
+            },
+            "trace_id": str(trace.trace_id),
+            "guardrail_action": trace.guardrail_action,
+            "guardrail_violations": input_violations,
+            "evaluation": None,
+            "query_route": "structured_sql",
+            "structured_result": {
+                key: structured_result[key]
+                for key in ("engine", "plan", "sql", "columns", "row_count", "results", "document_id", "source_name")
+                if key in structured_result
+            },
+            "sources": [],
+        }
+
+    query_route = classify_query_route(question) if settings.query_router_enabled and use_llm else "retrieval"
+    if query_route == "conversation":
+        answer = conversational_reply(question)
+        trace.answer_text = answer
+        trace.faithfulness_score = 1.0
+        trace.answer_relevance_score = 1.0
+        trace.finish()
+        if settings.lmops_enabled:
+            try:
+                get_lmops(settings).record_trace(
+                    trace,
+                    store_query_text=settings.lmops_store_query_text,
+                    store_answer_text=settings.lmops_store_answer_text,
+                )
+            except Exception:
+                pass
+        _record_audit_log(
+            settings,
+            query=f"omitted;chars:{len(question)}",
+            search_mode=search_mode,
+            client_ip=client_ip,
+            hit_count=0,
+            confidence_score=None,
+            hallucination_risk=None,
+        )
+        return {
+            "answer": answer,
+            "context": "",
+            "llm_configured": LLMClient(settings).configured,
+            "confidence_score": None,
+            "hallucination_risk": None,
+            "attribution_details": {"query_route": "conversation"},
+            "sources": [],
+            "trace_id": str(trace.trace_id),
+            "guardrail_action": trace.guardrail_action,
+            "guardrail_violations": input_violations,
+            "evaluation": None,
+            "query_route": query_route,
+        }
+
     # 2. 임베딩 생성 스팬 수행함
     span_embed = trace.start_span("embedding")
-    embedder = get_embedder(settings)
-    query_embedding = embedder.embed_query(question)
+    query_embedding = _query_embedding(settings, question)
     span_embed.finish()
 
-    filter_key = (
-        f"{document_id}:{project_name}:{department}:{max_security_level}:{min_quality_score}:"
-        f"{top_k}:{search_mode}:{store_type}:{guardrails_enabled}:"
-        f"{settings.guardrails_mask_pii}:{settings.guardrails_block_on_injection}"
+    filter_key = json.dumps(
+        {
+            "document_id": str(document_id) if document_id else None,
+            "project_name": project_name,
+            "department": department,
+            "max_security_level": max_security_level,
+            "min_quality_score": min_quality_score,
+            "top_k": top_k,
+            "search_mode": search_mode,
+            "store_type": store_type,
+            "guardrails_enabled": guardrails_enabled,
+            "hyde_enabled": settings.hyde_enabled,
+            "guardrails_mask_pii": settings.guardrails_mask_pii,
+            "guardrails_block_on_injection": settings.guardrails_block_on_injection,
+            "embedding_model": settings.embedding_model,
+            "embedding_dim": settings.embedding_dim,
+            "llm_base_url": settings.llm_base_url,
+            "llm_model": settings.llm_model,
+            "lora_name": lora_name,
+            "lora_served_model": dict(settings.llm_lora_adapters).get(lora_name) if lora_name else None,
+            "query_mode": query_mode,
+            "multi_query_enabled": settings.multi_query_enabled,
+            "contextual_retrieval_enabled": settings.contextual_retrieval_enabled,
+            "crag_enabled": settings.crag_enabled,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    if use_llm:
-        cached_result = _find_semantic_cache(query_embedding, filter_key)
+    if use_llm and semantic_cache_enabled:
+        cached_result = _find_semantic_cache(settings, query_embedding, filter_key)
         if cached_result is not None:
             return cached_result
 
     # 3. 벡터 및 하이브리드 검색 스팬 수행함
     span_retrieve = trace.start_span("retrieval", {"store_type": store_type, "search_mode": search_mode})
     candidate_k = max(15, top_k * 3)
-    raw_hits = _retrieve_candidates(
-        settings,
-        vector_store_type=store_type,
-        query_embedding=query_embedding,
-        query_text=question,
-        top_k=candidate_k,
-        document_id=document_id,
-        min_quality_score=min_quality_score,
-        project_name=project_name,
-        department=department,
-        max_security_level=max_security_level,
-        search_mode=search_mode,
-    )
-    span_retrieve.finish({"candidates_count": len(raw_hits)})
+    query_plan = plan_subqueries(question, LLMClient(settings)) if settings.multi_query_enabled and use_llm else None
+    planned_queries = list(query_plan.queries) if query_plan is not None else [question]
+    retrieval_inputs = [
+        (planned_query, query_embedding if planned_query == question else _query_embedding(settings, planned_query))
+        for planned_query in planned_queries
+    ]
+
+    def retrieve_one(item: tuple[str, list[float]]) -> list[dict[str, Any]]:
+        planned_query, planned_embedding = item
+        return _retrieve_candidates(
+            settings,
+            vector_store_type=store_type,
+            query_embedding=planned_embedding,
+            query_text=normalize_korean_query(planned_query),
+            top_k=candidate_k,
+            document_id=document_id,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+            search_mode=search_mode,
+        )
+
+    def retrieve_one_safely(item: tuple[str, list[float]]) -> list[dict[str, Any]]:
+        try:
+            return retrieve_one(item)
+        except Exception as exc:
+            logger.warning("하위 질의 검색 실패, 나머지 검색 결과를 유지함: %s", type(exc).__name__)
+            return []
+
+    if len(retrieval_inputs) > 1:
+        # 각 검색은 별도 저장소 연결을 사용하므로 2~3개 query retrieval을 병렬 처리함.
+        with ThreadPoolExecutor(max_workers=len(retrieval_inputs), thread_name_prefix="rag-query-plan") as executor:
+            ranked_candidates = list(executor.map(retrieve_one_safely, retrieval_inputs))
+        if not any(ranked_candidates):
+            raw_hits = retrieve_one((question, query_embedding))
+            ranked_candidates = [raw_hits]
+            retrieved_queries = [question]
+        else:
+            retrieved_queries = planned_queries
+            for ranked in ranked_candidates:
+                for hit in ranked:
+                    if hit.get("chunk_id") is None:
+                        hit["chunk_id"] = f"{hit.get('document_id')}:{hit.get('chunk_index')}"
+            raw_hits = reciprocal_rank_fusion(ranked_candidates, top_k=candidate_k)
+            for hit in raw_hits:
+                hit["score"] = float(hit.get("combined_score", 0.0))
+    else:
+        raw_hits = retrieve_one(retrieval_inputs[0])
+        ranked_candidates = [raw_hits]
+        retrieved_queries = planned_queries
+    span_retrieve.finish({
+        "candidates_count": len(raw_hits),
+        "subquery_count": len(planned_queries),
+        "query_plan_strategy": query_plan.strategy if query_plan is not None else "single",
+    })
 
     # 4. 신경망 또는 휴리스틱 리랭커 스팬 수행함
     span_rerank = trace.start_span("reranking")
     reranker = get_reranker(settings)
     hits = rerank_chunks(question, raw_hits, top_k=top_k, reranker=reranker)
+    hits = _expand_parent_context(hits)
     span_rerank.finish({"selected_count": len(hits)})
+
+    retrieval_gate: dict[str, Any] | None = None
+    crag_blocked = False
+    if settings.crag_enabled:
+        query_decisions = [
+            {
+                "query": planned_query,
+                "decision": evaluate_retrieval_relevance(planned_query, query_hits),
+            }
+            for planned_query, query_hits in zip(retrieved_queries, ranked_candidates, strict=False)
+        ]
+        all_accepted = bool(query_decisions) and all(
+            item["decision"].action == "accept" for item in query_decisions
+        )
+        first_rejected = next((item["decision"] for item in query_decisions if item["decision"].action != "accept"), None)
+        retrieval_gate = {
+            "action": "accept" if all_accepted else "abstain",
+            "suggested_action": None if all_accepted or first_rejected is None else first_rejected.action,
+            "reason": "all_subqueries_supported" if all_accepted else (first_rejected.reason if first_rejected else "no_query_decisions"),
+            "evidence": {
+                "subqueries": [
+                    {"query": item["query"], **item["decision"].evidence}
+                    for item in query_decisions
+                ],
+            },
+        }
+        if not all_accepted:
+            # 현재 안전한 재작성 후보가 없는 경우 생성하지 않고 근거 부족으로 보류함.
+            crag_blocked = True
+            hits = []
 
     # 5. LLM 답변 생성 스팬 수행함
     span_gen = trace.start_span("generation")
     context = build_context(hits)
     llm = LLMClient(settings)
-    answer = llm.complete(question, context) if use_llm and hits else None
-    span_gen.finish()
+    if crag_blocked and use_llm:
+        answer = "검색 근거가 충분하지 않아 답변을 보류했습니다. 질문을 구체화하거나 관련 문서를 추가해 주세요."
+        span_gen.finish({"skipped": True, "reason": "crag_relevance_gate"})
+    else:
+        answer = llm.complete(question, context, lora_name=lora_name) if use_llm and hits else None
+        span_gen.finish()
 
     # 6. 출력 가드레일 (PII 누출 방지 및 환각 검증) 수행함
     span_outguard = trace.start_span("output_guardrail")
@@ -677,12 +1069,16 @@ def query_rag(
 
     if settings.lmops_enabled:
         try:
-            get_lmops(settings).record_trace(trace)
+            get_lmops(settings).record_trace(
+                trace,
+                store_query_text=settings.lmops_store_query_text,
+                store_answer_text=settings.lmops_store_answer_text,
+            )
         except Exception:
             pass
 
     # SECURITY: 감사 로그에는 원문 대신 길이만 기록해 질의 본문 노출을 줄임
-    record_audit_log(
+    _record_audit_log(
         settings,
         query=f"omitted;chars:{len(question)}",
         search_mode=search_mode,
@@ -703,6 +1099,13 @@ def query_rag(
         "guardrail_action": trace.guardrail_action,
         "guardrail_violations": trace.guardrail_violations,
         "evaluation": eval_res.to_dict(),
+        "query_route": query_route,
+        "query_plan": {
+            "strategy": query_plan.strategy if query_plan is not None else "single",
+            "queries": planned_queries,
+            "executed_queries": retrieved_queries,
+        },
+        "retrieval_gate": retrieval_gate,
         "sources": [
             {
                 "rank": index,
@@ -711,17 +1114,156 @@ def query_rag(
                 "chunk_index": hit["chunk_index"],
                 "score": hit.get("score") or hit.get("rrf_score", 0.0),
                 "text": hit["text"],
-                "metadata": hit["metadata"],
+                "metadata": _source_metadata_without_parent_text(hit["metadata"]),
                 "quality_score": hit["quality_score"],
             }
             for index, hit in enumerate(hits, start=1)
         ],
     }
 
-    if use_llm and answer:
-        _save_semantic_cache(question, query_embedding, response_data, filter_key)
+    if (
+        use_llm
+        and answer
+        and semantic_cache_enabled
+        and not crag_blocked
+        and hallucination_risk != "high"
+        and trace.guardrail_action != GuardrailAction.BLOCK.value
+    ):
+        _save_semantic_cache(settings, query_embedding, response_data, filter_key)
 
     return response_data
+
+
+def query_structured_data(
+    settings: Settings,
+    *,
+    question: str,
+    document_id: UUID | None = None,
+    csv_text: str | None = None,
+    csv_delimiter: str = ",",
+    records: list[dict[str, Any]] | None = None,
+    table_index: int = 0,
+    use_llm_for_planning: bool = True,
+    project_name: str | None = None,
+    department: str | None = None,
+    max_security_level: int | None = None,
+    client_ip: str | None = None,
+) -> dict[str, Any]:
+    """지정 표 입력 또는 등록된 표 문서를 보수적으로 DuckDB에 라우팅함."""
+    if not settings.structured_query_enabled:
+        raise ValueError("STRUCTURED_QUERY_ENABLED 설정이 비활성화되어 있습니다.")
+    question = question.strip()
+    if not question:
+        raise ValueError("질문이 비어 있습니다.")
+    if document_id is None and any(value is not None for value in (project_name, department, max_security_level)):
+        raise ValueError("프로젝트·부서·보안 필터는 등록 문서를 지정할 때만 사용할 수 있습니다.")
+    guardrails_enabled = settings.guardrails_enabled
+    if guardrails_enabled:
+        guarded = InputGuardrail(
+            block_on_injection=settings.guardrails_block_on_injection,
+            mask_pii=settings.guardrails_mask_pii,
+        ).validate(question)
+        if guarded.action == GuardrailAction.BLOCK:
+            raise ValueError("보안 가드레일이 구조 질의를 차단했습니다.")
+        if guarded.action == GuardrailAction.MASK:
+            question = guarded.sanitized_text
+
+    markdown_text: str | None = None
+    source_name: str | None = None
+    if document_id is not None:
+        document = _get_document(settings, document_id)
+        stored = _get_document_content(settings, document_id)
+        if document is None or stored is None:
+            raise ValueError("구조 질의 대상 문서를 찾을 수 없습니다.")
+        source_name = str(stored.get("source_name", ""))
+        document_metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
+        if project_name is not None and document_metadata.get("project_name") != project_name:
+            raise ValueError("프로젝트 검색 범위에 속하지 않는 문서입니다.")
+        mime_type = str(document.get("mime_type") or "").lower()
+        suffix = source_name.rsplit(".", 1)[-1].lower() if "." in source_name else ""
+        if mime_type not in {
+            "text/csv",
+            "text/tab-separated-values",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        } and suffix not in {"csv", "tsv", "xlsx", "xls"}:
+            raise ValueError("DuckDB 질의는 CSV·TSV·XLSX 표 문서에서만 지원합니다.")
+        if department is not None or max_security_level is not None:
+            chunk_rows = get_document_chunks(settings, document_id)
+            if not chunk_rows:
+                raise ValueError("문서의 검색 메타데이터를 확인할 수 없습니다.")
+            for chunk in chunk_rows:
+                metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+                chunk_department = metadata.get("department")
+                if department is not None and chunk_department not in {None, department, "전사공통"}:
+                    raise ValueError("문서에 요청 부서 범위 밖의 청크가 포함되어 있습니다.")
+                if max_security_level is None:
+                    continue
+                try:
+                    security_level = int(metadata.get("security_level") or 1)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("문서 보안 등급 메타데이터가 유효하지 않습니다.") from exc
+                if security_level > max_security_level:
+                    raise ValueError("문서에 허용 보안 등급을 초과하는 청크가 포함되어 있습니다.")
+        stored_content = str(stored.get("content") or "")
+        if any(line.strip().startswith("|") and line.strip().endswith("|") for line in stored_content.splitlines()):
+            markdown_text = stored_content
+        else:
+            csv_text = stored_content
+            csv_delimiter = "\t" if suffix == "tsv" or mime_type == "text/tab-separated-values" else ","
+
+    elif records is not None and settings.guardrails_enabled and settings.guardrails_mask_pii:
+        safe_records: list[dict[str, Any]] = []
+        for record in records:
+            safe_record: dict[str, Any] = {}
+            for key, value in record.items():
+                if isinstance(value, str):
+                    safe_record[key] = detect_and_mask_pii(value, mask=True)[0]
+                else:
+                    safe_record[key] = value
+            safe_records.append(safe_record)
+        records = safe_records
+    elif csv_text is not None and settings.guardrails_enabled and settings.guardrails_mask_pii:
+        csv_text = detect_and_mask_pii(csv_text, mask=True)[0]
+
+    response = execute_structured_query(
+        settings,
+        question=question,
+        csv_text=csv_text,
+        csv_delimiter=csv_delimiter,
+        records=records,
+        markdown_text=markdown_text,
+        table_index=table_index,
+        allow_llm_planning=use_llm_for_planning,
+    )
+    if settings.guardrails_enabled and settings.guardrails_mask_pii:
+        safe_results: list[dict[str, Any]] = []
+        for row in response["results"]:
+            safe_row: dict[str, Any] = {}
+            for key, value in row.items():
+                safe_row[key] = detect_and_mask_pii(value, mask=True)[0] if isinstance(value, str) else value
+            safe_results.append(safe_row)
+        response["results"] = safe_results
+        for query_filter in response["plan"].get("filters", []):
+            if isinstance(query_filter.get("value"), str):
+                query_filter["value"] = detect_and_mask_pii(query_filter["value"], mask=True)[0]
+        response["answer"] = (
+            f"DuckDB 집계 결과 {len(safe_results)}건입니다. "
+            + json.dumps(safe_results[:10], ensure_ascii=False, default=str)
+        )
+    if document_id is not None:
+        response["document_id"] = document_id
+        response["source_name"] = source_name
+    _record_audit_log(
+        settings,
+        query=f"omitted;chars:{len(question)}",
+        search_mode="structured_sql",
+        client_ip=client_ip,
+        hit_count=1 if document_id is not None else 0,
+        confidence_score=None,
+        hallucination_risk=None,
+    )
+    return response
 
 
 def stream_query_rag(
@@ -749,6 +1291,9 @@ def stream_query_rag(
         for offset in range(0, len(answer), 48):
             yield emit({"type": "token", "content": answer[offset : offset + 48]})
 
+    use_llm = True
+    lora_name: str | None = None
+    query_mode = "auto"
     if options is not None:
         top_k = options.top_k
         document_id = options.document_id
@@ -758,6 +1303,12 @@ def stream_query_rag(
         max_security_level = options.max_security_level
         search_mode = options.search_mode
         client_ip = options.client_ip
+        use_llm = options.use_llm
+        lora_name = options.lora_name
+        query_mode = options.query_mode
+        if lora_name is not None and lora_name not in dict(settings.llm_lora_adapters):
+            yield emit({"type": "error", "message": "요청한 LoRA 별칭이 서버 허용 목록에 없습니다."})
+            return
         if options.vector_store_type is not None and options.vector_store_type != settings.vector_store_type:
             yield f"data: {json.dumps({'type': 'error', 'message': '질의 저장소는 VECTOR_STORE_TYPE 설정과 같아야 합니다.'}, ensure_ascii=False)}\n\n"
             return
@@ -791,12 +1342,24 @@ def stream_query_rag(
             ]})
             yield from emit_answer(blocked_answer)
             yield emit({
+                "type": "guardrail",
+                "phase": "final",
+                "action": GuardrailAction.BLOCK.value,
+                "faithfulness": 0.0,
+                "risk_level": "high",
+                "citation_validity": {"valid": False, "valid_citations": [], "invalid_citations": []},
+                "violations": [
+                    {"category": violation["category"], "severity": violation["severity"]}
+                    for violation in input_violations
+                ],
+            })
+            yield emit({
                 "type": "attribution",
                 "confidence_score": 0.0,
                 "hallucination_risk": "high",
                 "attribution_details": {"blocked_by_guardrail": True},
             })
-            record_audit_log(
+            _record_audit_log(
                 settings,
                 query=f"omitted;chars:{original_question_length}",
                 search_mode=search_mode,
@@ -812,6 +1375,7 @@ def stream_query_rag(
 
     yield emit({
         "type": "guardrail",
+        "phase": "input",
         "action": input_action.value,
         "violations": [
             {"category": violation["category"], "severity": violation["severity"]}
@@ -819,26 +1383,175 @@ def stream_query_rag(
         ],
     })
 
-    embedder = get_embedder(settings)
-    query_embedding = embedder.embed_query(question)
+    structured_route = query_mode == "structured_sql"
+    if query_mode == "auto" and settings.structured_query_enabled and document_id is not None and is_numeric_aggregation_question(question):
+        document = _get_document(settings, document_id)
+        if document is not None and is_structured_source(
+            str(document.get("source_name") or ""),
+            document.get("mime_type"),
+        ):
+            structured_route = True
+    if structured_route:
+        if document_id is None:
+            yield emit({"type": "error", "message": "구조 질의에는 document_id가 필요합니다. CSV 본문은 /query/structured를 사용하세요."})
+            return
+        try:
+            structured_result = query_structured_data(
+                settings,
+                question=question,
+                document_id=document_id,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+                client_ip=client_ip,
+                use_llm_for_planning=use_llm,
+            )
+        except Exception as exc:
+            yield emit({"type": "error", "message": str(exc) if isinstance(exc, ValueError) else "구조 질의를 처리하지 못했습니다."})
+            return
+        yield emit({"type": "sources", "sources": []})
+        yield emit({
+            "type": "structured_result",
+            "query_route": "structured_sql",
+            "engine": "duckdb",
+            "document_id": str(document_id),
+            "plan": structured_result["plan"],
+            "columns": structured_result["columns"],
+            "row_count": structured_result["row_count"],
+            "results": structured_result["results"],
+        })
+        yield from emit_answer(structured_result["answer"])
+        yield emit({
+            "type": "guardrail",
+            "phase": "final",
+            "action": input_action.value,
+            "faithfulness": None,
+            "risk_level": None,
+            "citation_validity": {"valid": False, "valid_citations": [], "invalid_citations": []},
+            "violations": input_violations,
+        })
+        yield emit({"type": "attribution", "confidence_score": None, "hallucination_risk": None,
+                    "attribution_details": {"method": "duckdb_aggregate", "document_id": str(document_id)}})
+        yield "data: [DONE]\n\n"
+        return
+
+    query_route = classify_query_route(question) if settings.query_router_enabled and use_llm else "retrieval"
+    if query_route == "conversation":
+        answer = conversational_reply(question)
+        yield emit({"type": "sources", "sources": []})
+        yield from emit_answer(answer)
+        yield emit({
+            "type": "guardrail",
+            "phase": "final",
+            "action": input_action.value,
+            "faithfulness": None,
+            "risk_level": None,
+            "citation_validity": {"valid": False, "valid_citations": [], "invalid_citations": []},
+            "violations": [],
+        })
+        _record_audit_log(
+            settings,
+            query=f"omitted;chars:{original_question_length}",
+            search_mode=search_mode,
+            client_ip=client_ip,
+            hit_count=0,
+            confidence_score=None,
+            hallucination_risk=None,
+        )
+        yield emit({"type": "attribution", "confidence_score": None, "hallucination_risk": None,
+                    "attribution_details": {"query_route": "conversation"}})
+        yield "data: [DONE]\n\n"
+        return
 
     candidate_k = max(15, top_k * 3)
-    raw_hits = _retrieve_candidates(
-        settings,
-        vector_store_type=settings.vector_store_type,
-        query_embedding=query_embedding,
-        query_text=question,
-        top_k=candidate_k,
-        document_id=document_id,
-        min_quality_score=min_quality_score,
-        project_name=project_name,
-        department=department,
-        max_security_level=max_security_level,
-        search_mode=search_mode,
-    )
+    query_embedding = _query_embedding(settings, question)
+    stream_plan = plan_subqueries(question, LLMClient(settings)) if settings.multi_query_enabled and use_llm else None
+    planned_queries = list(stream_plan.queries) if stream_plan is not None else [question]
+    retrieval_inputs = [
+        (query, query_embedding if query == question else _query_embedding(settings, query))
+        for query in planned_queries
+    ]
+
+    def retrieve_stream_query(item: tuple[str, list[float]]) -> list[dict[str, Any]]:
+        planned_query, planned_embedding = item
+        return _retrieve_candidates(
+            settings,
+            vector_store_type=settings.vector_store_type,
+            query_embedding=planned_embedding,
+            query_text=normalize_korean_query(planned_query),
+            top_k=candidate_k,
+            document_id=document_id,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+            search_mode=search_mode,
+        )
+
+    def retrieve_stream_query_safely(item: tuple[str, list[float]]) -> list[dict[str, Any]]:
+        try:
+            return retrieve_stream_query(item)
+        except Exception as exc:
+            logger.warning("스트리밍 하위 질의 검색 실패: %s", type(exc).__name__)
+            return []
+
+    if len(retrieval_inputs) > 1:
+        with ThreadPoolExecutor(max_workers=len(retrieval_inputs), thread_name_prefix="rag-stream-plan") as executor:
+            candidate_lists = list(executor.map(retrieve_stream_query_safely, retrieval_inputs))
+        if not any(candidate_lists):
+            raw_hits = retrieve_stream_query((question, query_embedding))
+            candidate_lists = [raw_hits]
+            retrieved_queries = [question]
+        else:
+            retrieved_queries = planned_queries
+            for ranked in candidate_lists:
+                for hit in ranked:
+                    if hit.get("chunk_id") is None:
+                        hit["chunk_id"] = f"{hit.get('document_id')}:{hit.get('chunk_index')}"
+            raw_hits = reciprocal_rank_fusion(candidate_lists, top_k=candidate_k)
+            for hit in raw_hits:
+                hit["score"] = float(hit.get("combined_score", 0.0))
+    else:
+        raw_hits = retrieve_stream_query(retrieval_inputs[0])
+        candidate_lists = [raw_hits]
+        retrieved_queries = planned_queries
 
     reranker = get_reranker(settings)
     hits = rerank_chunks(question, raw_hits, top_k=top_k, reranker=reranker)
+    hits = _expand_parent_context(hits)
+    yield emit({
+        "type": "query_plan",
+        "strategy": stream_plan.strategy if stream_plan is not None else "single",
+        "subqueries": planned_queries,
+        "executed_queries": retrieved_queries,
+    })
+
+    stream_gate: dict[str, Any] | None = None
+    crag_blocked = False
+    if settings.crag_enabled:
+        decisions = [
+            {
+                "query": planned_query,
+                "decision": evaluate_retrieval_relevance(planned_query, query_hits),
+            }
+            for planned_query, query_hits in zip(retrieved_queries, candidate_lists, strict=False)
+        ]
+        all_accepted = bool(decisions) and all(item["decision"].action == "accept" for item in decisions)
+        first_rejected = next((item["decision"] for item in decisions if item["decision"].action != "accept"), None)
+        stream_gate = {
+            "action": "accept" if all_accepted else "abstain",
+            "suggested_action": None if all_accepted or first_rejected is None else first_rejected.action,
+            "reason": "all_subqueries_supported" if all_accepted else (first_rejected.reason if first_rejected else "no_query_decisions"),
+            "evidence": {
+                "subqueries": [
+                    {"query": item["query"], **item["decision"].evidence}
+                    for item in decisions
+                ],
+            },
+        }
+        if not all_accepted:
+            crag_blocked = True
+            hits = []
 
     sources = [
         {
@@ -855,12 +1568,43 @@ def stream_query_rag(
 
     # 1. 출처 및 근거 메타데이터 전송
     yield emit({"type": "sources", "sources": sources})
+    if stream_gate is not None:
+        yield emit({"type": "retrieval_gate", **stream_gate})
 
     context = build_context(hits)
     llm = LLMClient(settings)
 
+    if not use_llm:
+        confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(None, hits)
+        yield emit({
+            "type": "guardrail",
+            "phase": "final",
+            "action": input_action.value,
+            "faithfulness": None,
+            "risk_level": hallucination_risk,
+            "citation_validity": {
+                "valid": False,
+                "valid_citations": [],
+                "invalid_citations": [],
+            },
+            "violations": [],
+        })
+        _record_audit_log(
+            settings,
+            query=f"omitted;chars:{original_question_length}",
+            search_mode=search_mode,
+            client_ip=client_ip,
+            hit_count=len(hits),
+            confidence_score=confidence_score,
+            hallucination_risk=hallucination_risk,
+        )
+        yield emit({"type": "attribution", "confidence_score": confidence_score,
+                    "hallucination_risk": hallucination_risk, "attribution_details": attribution_details})
+        yield "data: [DONE]\n\n"
+        return
+
     if not hits:
-        record_audit_log(
+        _record_audit_log(
             settings,
             query=f"omitted;chars:{original_question_length}",
             search_mode=search_mode,
@@ -869,53 +1613,196 @@ def stream_query_rag(
             confidence_score=0.0,
             hallucination_risk="high",
         )
-        yield from emit_answer("관련 근거 문서를 찾을 수 없습니다.")
+        yield from emit_answer(
+            "검색 근거가 충분하지 않아 답변을 보류했습니다. 질문을 구체화하거나 관련 문서를 추가해 주세요."
+            if crag_blocked
+            else "관련 근거 문서를 찾을 수 없습니다."
+        )
+        yield emit({
+            "type": "guardrail",
+            "phase": "final",
+            "action": input_action.value,
+            "faithfulness": 0.0,
+            "risk_level": "high",
+            "citation_validity": {"valid": False, "valid_citations": [], "invalid_citations": []},
+            "violations": [],
+        })
         yield "data: [DONE]\n\n"
         return
 
     if not llm.configured:
         yield from emit_answer("LLM 설정이 완료되지 않았습니다.")
+        yield emit({
+            "type": "guardrail",
+            "phase": "final",
+            "action": input_action.value,
+            "faithfulness": 0.0,
+            "risk_level": "high",
+            "citation_validity": {"valid": False, "valid_citations": [], "invalid_citations": []},
+            "violations": [],
+        })
         yield "data: [DONE]\n\n"
         return
 
-    full_answer_parts: list[str] = []
-    for token in llm.complete_stream(question, context):
-        full_answer_parts.append(token)
-
-    full_answer = "".join(full_answer_parts)
+    raw_answer_parts: list[str] = []
+    safe_answer_parts: list[str] = []
     guardrail_action = input_action
     output_violations: list[dict[str, Any]] = []
-    if guardrails_enabled and full_answer:
-        output_result = OutputGuardrail(mask_pii=settings.guardrails_mask_pii).validate(full_answer, hits)
-        output_violations = [asdict(violation) for violation in output_result.violations]
-        severe_output_violation = any(
+    output_guardrail_result = None
+    pending = ""
+    blocked_during_stream = False
+    output_guard = OutputGuardrail(mask_pii=settings.guardrails_mask_pii) if guardrails_enabled else None
+
+    def validate_and_emit(segment: str, safety_lookahead: str = "") -> Any:
+        nonlocal guardrail_action, blocked_during_stream
+        if not segment:
+            return
+        safe_segment = segment
+        if output_guard is not None:
+            if safety_lookahead:
+                probe = output_guard.validate(segment + safety_lookahead, hits)
+                probe_severe = any(
+                    violation.severity in {"critical", "high"}
+                    and violation.category in {"faithfulness", "system_leak", "safety"}
+                    for violation in probe.violations
+                )
+                if probe_severe:
+                    output_violations.extend(asdict(violation) for violation in probe.violations)
+                    blocked_during_stream = True
+                    guardrail_action = GuardrailAction.BLOCK
+                    return
+            result = output_guard.validate(segment, hits)
+            output_violations.extend(asdict(violation) for violation in result.violations)
+            severe = any(
+                violation.severity in {"critical", "high"}
+                and violation.category in {"faithfulness", "system_leak", "safety"}
+                for violation in result.violations
+            )
+            if severe:
+                blocked_during_stream = True
+                guardrail_action = GuardrailAction.BLOCK
+                return
+            if result.action == GuardrailAction.MASK:
+                safe_segment = result.sanitized_text
+                guardrail_action = GuardrailAction.MASK
+                yield emit({
+                    "type": "guardrail",
+                    "phase": "stream",
+                    "action": GuardrailAction.MASK.value,
+                    "violations": [
+                        {"category": violation.category, "severity": violation.severity}
+                        for violation in result.violations
+                    ],
+                })
+            elif result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
+                guardrail_action = GuardrailAction.FLAG
+        safe_answer_parts.append(safe_segment)
+        yield from emit_answer(safe_segment)
+
+    # 문장 경계와 길이 제한 윈도우 단위로 출력 검사 후 전송함. 마지막 64자 이상은
+    # 다음 조각과 함께 검사해 전화번호·이메일이 토큰 경계에서 잘려 나가지 않게 함.
+    for token in llm.complete_stream(question, context, lora_name=lora_name):
+        raw_answer_parts.append(token)
+        pending += token
+        while True:
+            boundary = re.search(r"(?<=[.!?。！？])(?:[ \t]+|\n+)|\n+", pending)
+            if boundary is not None:
+                segment_end = boundary.end()
+            elif len(pending) > 480:
+                safe_limit = len(pending) - 64
+                space = pending.rfind(" ", 0, safe_limit)
+                newline = pending.rfind("\n", 0, safe_limit)
+                segment_end = max(space, newline) + 1
+                if segment_end <= 1:
+                    segment_end = safe_limit
+            else:
+                break
+            # 개인정보 정규식에서 허용하는 공백 구분 숫자가 출력 경계에서 잘리지
+            # 않도록, 후보 경계가 일치 범위 안이면 식별자 앞까지 경계를 당김.
+            _checked_text, pii_matches = detect_and_mask_pii(pending, mask=False)
+            for pii_match in pii_matches:
+                match_start = int(pii_match.get("start", -1))
+                match_end = int(pii_match.get("end", -1))
+                if match_start < segment_end < match_end:
+                    segment_end = match_start
+            if segment_end <= 0:
+                break
+            segment, remainder = pending[:segment_end], pending[segment_end:]
+            pending = remainder
+            yield from validate_and_emit(segment, remainder[:64])
+            if blocked_during_stream:
+                break
+        if blocked_during_stream:
+            break
+
+    if not blocked_during_stream and pending:
+        yield from validate_and_emit(pending)
+
+    raw_answer = "".join(raw_answer_parts)
+    if output_guard is not None and raw_answer:
+        output_guardrail_result = output_guard.validate(raw_answer, hits)
+        final_violations = [asdict(violation) for violation in output_guardrail_result.violations]
+        # Keep sentence-window findings for early PII masks and deduplicate by rule.
+        seen_violation_keys = {
+            (item.get("rule_name"), item.get("category"), item.get("severity"))
+            for item in output_violations
+        }
+        for violation in final_violations:
+            key = (violation.get("rule_name"), violation.get("category"), violation.get("severity"))
+            if key not in seen_violation_keys:
+                output_violations.append(violation)
+                seen_violation_keys.add(key)
+        severe_final = any(
             violation.severity in {"critical", "high"}
             and violation.category in {"faithfulness", "system_leak", "safety"}
-            for violation in output_result.violations
+            for violation in output_guardrail_result.violations
         )
-        if severe_output_violation:
+        if severe_final:
             guardrail_action = GuardrailAction.BLOCK
-            full_answer = "검색 근거에서 답변 내용을 충분히 확인할 수 없어 응답을 보류했습니다."
-        elif output_result.action == GuardrailAction.MASK:
+            blocked_during_stream = True
+        elif output_guardrail_result.action == GuardrailAction.MASK:
             guardrail_action = GuardrailAction.MASK
-            full_answer = output_result.sanitized_text
-        elif output_result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
+        elif output_guardrail_result.action == GuardrailAction.FLAG and guardrail_action == GuardrailAction.ALLOW:
             guardrail_action = GuardrailAction.FLAG
 
+    if blocked_during_stream:
+        refusal = "추가 응답은 출력 가드레일에 의해 보류되었습니다."
+        safe_answer_parts.append(refusal)
+        yield from emit_answer(refusal)
+    full_answer = "".join(safe_answer_parts)
+    if output_guardrail_result is None and not full_answer:
+        full_answer = ""
+
+    confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(full_answer, hits)
+    if output_guardrail_result is not None:
+        faithfulness = round(1.0 - float(output_guardrail_result.metadata.get("hallucination_score", 0.0)), 4)
+        output_risk_score = output_guardrail_result.risk_score
+    else:
+        faithfulness = round(float(attribution_details.get("grounding_ratio", 0.0)), 4)
+        output_risk_score = round(1.0 - faithfulness, 4)
+
+    valid_citations = attribution_details.get("valid_citations", [])
+    invalid_citations = attribution_details.get("invalid_citations", [])
     yield emit({
         "type": "guardrail",
+        "phase": "final",
         "action": guardrail_action.value,
+        "faithfulness": faithfulness,
+        "risk_score": output_risk_score,
+        "risk_level": hallucination_risk,
+        "citation_validity": {
+            "valid": bool(valid_citations) and not invalid_citations,
+            "valid_citations": valid_citations,
+            "invalid_citations": invalid_citations,
+        },
         "violations": [
             {"category": violation["category"], "severity": violation["severity"]}
             for violation in output_violations
         ],
     })
-    yield from emit_answer(full_answer)
-
-    confidence_score, hallucination_risk, attribution_details = evaluate_answer_attribution(full_answer, hits)
 
     # SECURITY: 스트리밍 질의에 대해서도 감사 로그를 동일하게 기록함
-    record_audit_log(
+    _record_audit_log(
         settings,
         query=f"omitted;chars:{original_question_length}",
         search_mode=search_mode,
@@ -932,7 +1819,7 @@ def stream_query_rag(
 
 def document_summary(settings: Settings, document_id: UUID) -> dict[str, Any] | None:
     """문서 ID로 원문을 제외한 메타데이터와 품질 요약을 조회함"""
-    row = get_document(settings, document_id)
+    row = _get_document(settings, document_id)
     if row is None:
         return None
     return {
@@ -955,7 +1842,7 @@ def diagnose_document_quality(settings: Settings, document_id: UUID) -> dict[str
     Caveats:
         인제스트 당시 저장한 리포트가 아닌 현재 진단 로직의 결과를 반환함
     """
-    row = get_document_content(settings, document_id)
+    row = _get_document_content(settings, document_id)
     if row is None:
         return None
     return diagnose_text(row["content"], row["source_name"], row.get("metadata") or {})
@@ -1169,6 +2056,22 @@ EXTRACTION_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+def _extraction_pydantic_model(schema_type: str, sample: dict[str, Any]) -> type[BaseModel]:
+    """정적 추출 스키마를 strict JSON Schema를 내는 Pydantic 모델로 변환함"""
+    fields: dict[str, tuple[Any, Any]] = {}
+    for index, (external_name, example) in enumerate(sample.items()):
+        field_type: Any = list[str] | None if isinstance(example, list) else str | None
+        fields[f"field_{index}"] = (
+            field_type,
+            Field(..., alias=external_name, description=str(example)[:500]),
+        )
+    return create_model(
+        f"Extraction_{schema_type}",
+        __config__=ConfigDict(extra="forbid", populate_by_name=True),
+        **fields,
+    )
+
+
 def extract_document_entities(
     settings: Settings,
     *,
@@ -1209,7 +2112,7 @@ def extract_document_entities(
     target_text = ""
 
     if document_id is not None:
-        doc = get_document_content(settings, document_id)
+        doc = _get_document_content(settings, document_id)
         if not doc:
             raise ValueError(f"ID가 {document_id}인 문서를 찾을 수 없습니다.")
         source_name = doc["source_name"]
@@ -1276,6 +2179,7 @@ def extract_document_entities(
             guardrail_action = GuardrailAction.FLAG
 
     schema_sample = json.dumps(schema_info["sample"], ensure_ascii=False, indent=2)
+    extraction_model = _extraction_pydantic_model(schema_type, schema_info["sample"])
 
     system_prompt = (
         "당신은 공공기관 및 기업 문서 분석과 정형 데이터 추출을 전담하는 고성능 AI입니다.\n"
@@ -1290,6 +2194,8 @@ def extract_document_entities(
         f"다음 문서에서 '{schema_type}' 정보를 추출하십시오:\n\n{prompt_text}",
         "",
         system_prompt=system_prompt,
+        response_schema=extraction_model.model_json_schema(by_alias=True),
+        response_schema_name="rag-vllm-extraction",
     )
 
     response_for_parsing = raw_response
@@ -1339,11 +2245,11 @@ def extract_document_entities(
         if not isinstance(parsed, dict):
             extracted_dict = {"parse_error": "유효한 JSON 객체를 받지 못했습니다.", "response_omitted": True}
         else:
-            allowed_fields = set(schema_info["sample"])
-            extracted_dict = {key: value for key, value in parsed.items() if key in allowed_fields}
-            unexpected_field_count = sum(1 for key in parsed if key not in allowed_fields)
-            if unexpected_field_count:
-                extracted_dict["schema_warning"] = f"지원하지 않는 필드 {unexpected_field_count}개를 제외했습니다."
+            try:
+                validated = extraction_model.model_validate(parsed)
+                extracted_dict = validated.model_dump(by_alias=True, exclude_none=False)
+            except Exception:
+                extracted_dict = {"parse_error": "응답이 추출 스키마와 일치하지 않습니다.", "response_omitted": True}
 
     return {
         "source_name": source_name,
@@ -1362,7 +2268,12 @@ def list_all_documents(
     search: str | None = None,
 ) -> dict[str, Any]:
     """검색·페이지 조건을 적용한 문서 요약 목록과 전체 건수를 반환함"""
-    rows, total = list_documents(settings, limit=limit, offset=offset, search=search)
+    store = _local_engine(settings)
+    rows, total = (
+        store.list_documents(limit=limit, offset=offset, search=search)
+        if store is not None
+        else list_documents(settings, limit=limit, offset=offset, search=search)
+    )
     items = []
     for r in rows:
         items.append(
@@ -1387,7 +2298,12 @@ def list_all_documents(
 
 def get_chunks_for_document(settings: Settings, document_id: UUID) -> list[dict[str, Any]]:
     """문서에 속한 검색 청크를 원문 순서와 메타데이터로 반환함"""
-    rows = get_document_chunks(settings, document_id)
+    store = _local_engine(settings)
+    rows = (
+        store.get_document_chunks(document_id)
+        if store is not None
+        else get_document_chunks(settings, document_id)
+    )
     return [
         {
             "id": r["id"],
@@ -1401,21 +2317,54 @@ def get_chunks_for_document(settings: Settings, document_id: UUID) -> list[dict[
 
 def remove_document(settings: Settings, document_id: UUID) -> bool:
     """문서와 연결된 청크를 삭제하고 삭제 여부를 반환함"""
-    if get_document(settings, document_id) is None:
+    store = _local_engine(settings)
+    if _get_document(settings, document_id) is None:
         return False
+    if store is not None:
+        deleted = store.delete_document(document_id)
+        if deleted:
+            clear_semantic_cache(settings)
+        return deleted
     if settings.vector_store_type != "pgvector":
         vector_store = get_vector_store(settings)
         if not vector_store.delete_document(document_id):
             raise ConnectionError("선택된 벡터 저장소에서 문서 색인을 삭제하지 못했습니다.")
     deleted = delete_document(settings, document_id)
     if deleted:
-        clear_semantic_cache()
+        clear_semantic_cache(settings)
     return deleted
+
+
+def remove_scoped_document(settings: Settings, *, source_name: str, project_name: str) -> bool:
+    """고정 앱 범위의 정확한 출처가 호출 후 존재하지 않으면 성공으로 반환함"""
+    store = _local_engine(settings)
+    lookup = (
+        (lambda: store.find_document_id_by_source_scope(source_name=source_name, project_name=project_name))
+        if store is not None
+        else (lambda: find_document_id_by_source_scope(settings, source_name=source_name, project_name=project_name))
+    )
+    document_id = lookup()
+    if document_id is not None:
+        remove_document(settings, document_id)
+    # Treat an already absent source as an idempotent delete success. Recheck the
+    # exact source scope after removal to make interrupted retries reconcilable.
+    return lookup() is None
 
 
 def get_stats(settings: Settings) -> dict[str, Any]:
     """문서·청크·임베딩·LLM 설정의 현재 시스템 통계를 반환함"""
-    stats = get_system_stats(settings)
+    store = _local_engine(settings)
+    if store is not None:
+        store_stats = store.get_stats()
+        stats = {
+            "total_documents": store_stats["documents_count"],
+            "total_chunks": store_stats["vectors_count"],
+            "embedding_dimension": settings.embedding_dim,
+            "embedding_model": settings.embedding_model,
+            "vector_store": store_stats,
+        }
+    else:
+        stats = get_system_stats(settings)
     llm = LLMClient(settings)
     stats["llm_configured"] = llm.configured
     stats["llm_model"] = settings.llm_model
@@ -1452,7 +2401,7 @@ def enterprise_quality_service(
     target_text = ""
     source_name = "inline"
     if document_id is not None:
-        doc = get_document_content(settings, document_id)
+        doc = _get_document_content(settings, document_id)
         if not doc:
             raise ValueError(f"ID가 {document_id}인 문서를 찾을 수 없습니다.")
         source_name = doc["source_name"]
@@ -1491,4 +2440,6 @@ def structured_quality_service(
 
 def get_recent_audit_logs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
     """보안 검토용 최근 감사 로그를 개인정보 비공개 형태로 조회함"""
+    if settings.vector_store_type == "cpp_engine":
+        return []
     return get_audit_logs(settings, limit=limit)

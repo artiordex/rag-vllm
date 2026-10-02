@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 import threading
+from contextlib import contextmanager
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -24,6 +26,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .config import Settings
+from .korean_search import bm25_rerank, normalize_korean_query, tokenize_korean
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +223,12 @@ def init_db(settings: Settings) -> None:
         )
         connection.execute(
             """
+            CREATE INDEX IF NOT EXISTS rag_documents_project_source_idx
+            ON rag_documents ((metadata->>'project_name'), source_name)
+            """
+        )
+        connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_rag_chunks_document_id
             ON rag_chunks (document_id)
             """
@@ -288,8 +297,14 @@ def check_db(settings: Settings) -> bool:
         connection.close()
 
 
-def find_document_by_hash(settings: Settings, source_name: str, content_hash: str) -> dict[str, Any] | None:
-    """원천 이름과 정규화 본문 해시가 같은 문서의 요약을 조회함
+def find_document_by_hash(
+    settings: Settings,
+    source_name: str,
+    content_hash: str,
+    *,
+    project_name: str | None = None,
+) -> dict[str, Any] | None:
+    """원천 이름·본문 해시와 선택한 프로젝트 범위가 같은 문서 요약을 조회함
 
     Returns:
         dict[str, Any] | None: 중복 문서 요약 또는 대상이 없을 때 None임
@@ -299,17 +314,19 @@ def find_document_by_hash(settings: Settings, source_name: str, content_hash: st
     """
     connection = _connect(settings)
     try:
-        return connection.execute(
-            """
+        query = """
             SELECT d.id, d.source_name, d.source_type, d.mime_type, d.metadata,
                    d.quality_report, COUNT(c.id)::integer AS chunk_count
             FROM rag_documents d
             LEFT JOIN rag_chunks c ON c.document_id = d.id
             WHERE d.source_name = %s AND d.content_hash = %s
-            GROUP BY d.id
-            """,
-            (source_name, content_hash),
-        ).fetchone()
+        """
+        params: list[Any] = [source_name, content_hash]
+        if project_name is not None:
+            query += " AND d.metadata->>'project_name' = %s"
+            params.append(project_name)
+        query += " GROUP BY d.id"
+        return connection.execute(query, params).fetchone()
     except Exception as exc:
         raise DatabaseError("문서 중복 여부를 확인하지 못했습니다.") from exc
     finally:
@@ -363,10 +380,13 @@ def save_document(
     connection = _connect(settings, register_embedding=True)
     try:
         with connection.transaction():
-            existing = connection.execute(
-                "SELECT id FROM rag_documents WHERE source_name = %s AND content_hash = %s",
-                (source_name, content_hash),
-            ).fetchone()
+            project_name = metadata.get("project_name")
+            existing_query = "SELECT id FROM rag_documents WHERE source_name = %s AND content_hash = %s"
+            existing_params: list[Any] = [source_name, content_hash]
+            if project_name is not None:
+                existing_query += " AND metadata->>'project_name' = %s"
+                existing_params.append(project_name)
+            existing = connection.execute(existing_query, existing_params).fetchone()
             if existing:
                 count = connection.execute(
                     "SELECT COUNT(*)::integer AS count FROM rag_chunks WHERE document_id = %s",
@@ -376,9 +396,14 @@ def save_document(
 
             # NOTE: 프로젝트 문서 동기화는 같은 경로의 이전 버전을 남기지 않도록 교체함
             if replace_existing_source:
+                delete_query = "DELETE FROM rag_documents WHERE source_name = %s"
+                delete_params: list[Any] = [source_name]
+                if project_name is not None:
+                    delete_query += " AND metadata->>'project_name' = %s"
+                    delete_params.append(project_name)
                 connection.execute(
-                    "DELETE FROM rag_documents WHERE source_name = %s",
-                    (source_name,),
+                    delete_query,
+                    delete_params,
                 )
 
             document_id = document_id or uuid4()
@@ -453,6 +478,98 @@ def get_document(settings: Settings, document_id: UUID) -> dict[str, Any] | None
         raise DatabaseError("문서를 조회하지 못했습니다.") from exc
     finally:
         connection.close()
+
+
+def find_document_id_by_source_scope(
+    settings: Settings,
+    *,
+    source_name: str,
+    project_name: str,
+) -> UUID | None:
+    """고정된 앱 코퍼스 안에서 정확한 원천 이름에 해당하는 ID만 조회함"""
+    connection = _connect(settings)
+    try:
+        row = connection.execute(
+            """
+            SELECT id
+            FROM rag_documents
+            WHERE source_name = %s AND metadata->>'project_name' = %s
+            LIMIT 1
+            """,
+            (source_name, project_name),
+        ).fetchone()
+        return row["id"] if row else None
+    except Exception as exc:
+        raise DatabaseError("앱 코퍼스 문서를 조회하지 못했습니다.") from exc
+    finally:
+        connection.close()
+
+
+def find_document_sources_by_ids(
+    settings: Settings,
+    document_ids: list[UUID],
+    *,
+    project_name: str | None = None,
+) -> dict[UUID, str]:
+    """벡터 검색 결과 중 PostgreSQL에 남아 있는 문서의 원천 이름만 반환함"""
+    if not document_ids:
+        return {}
+
+    connection = _connect(settings)
+    try:
+        query = "SELECT id, source_name FROM rag_documents WHERE id = ANY(%s::uuid[])"
+        params: list[Any] = [document_ids]
+        if project_name is not None:
+            query += " AND metadata->>'project_name' = %s"
+            params.append(project_name)
+        rows = connection.execute(query, params).fetchall()
+        return {row["id"]: row["source_name"] for row in rows}
+    except Exception as exc:
+        raise DatabaseError("벡터 검색 결과의 문서 범위를 확인하지 못했습니다.") from exc
+    finally:
+        connection.close()
+
+
+@contextmanager
+def app_source_lock(settings: Settings, *, project_name: str, source_name: str):
+    """앱 출처별 인제스트·삭제를 PostgreSQL session lock으로 직렬화함"""
+    lock_key = int.from_bytes(
+        hashlib.sha256(f"rag-chat:{project_name}:{source_name}".encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+    connection = None
+    try:
+        connection = psycopg.connect(
+            settings.database_url,
+            connect_timeout=settings.database_connect_timeout,
+            autocommit=True,
+            row_factory=dict_row,
+        )
+        # A queued app ingest/delete must not pin an API worker indefinitely.
+        connection.execute("SET lock_timeout = '30s'")
+        connection.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+    except Exception as exc:
+        if connection is not None:
+            connection.close()
+        raise DatabaseError("앱 문서 작업 잠금을 획득하지 못했습니다.") from exc
+
+    try:
+        yield
+    finally:
+        try:
+            unlocked = connection.execute(
+                "SELECT pg_advisory_unlock(%s) AS unlocked",
+                (lock_key,),
+            ).fetchone()
+            if not unlocked or unlocked.get("unlocked") is not True:
+                raise DatabaseError("앱 문서 작업 잠금을 해제하지 못했습니다.")
+        except Exception as exc:
+            if isinstance(exc, DatabaseError):
+                raise
+            raise DatabaseError("앱 문서 작업 잠금을 해제하지 못했습니다.") from exc
+        finally:
+            connection.close()
 
 
 def get_document_content(settings: Settings, document_id: UUID) -> dict[str, Any] | None:
@@ -801,8 +918,8 @@ def search_chunks_hybrid(
         list[dict[str, Any]]: 두 검색 신호를 결합한 최종 후보 목록임
 
     Caveats:
-        키워드 검색은 상위 5개 토큰을 ILIKE로 비교하는 보조 신호이며, 공식 BM25
-        점수나 도메인 품질 판정으로 해석하지 않음
+        형태소 BM25는 FTS와 부분 문자열 검색에서 얻은 최대 60개 후보를 재정렬하는 점수이며,
+        전체 코퍼스에 대한 사전 계산 점수나 도메인 품질 판정으로 해석하지 않음
     """
     # NOTE: 의미 유사도 후보를 넉넉히 확보해 후속 RRF에서 재선택함
     dense_candidates = search_chunks(
@@ -818,7 +935,9 @@ def search_chunks_hybrid(
     )
 
     # NOTE: 짧은 핵심어를 이용해 원문 일치 후보를 보강함 (FTS 인덱스 우선 및 ILIKE 폴백)
-    keywords = [k.strip() for k in query_text.split() if len(k.strip()) >= 2]
+    original_query_text = query_text
+    normalized_query = normalize_korean_query(query_text)
+    keywords = tokenize_korean(normalized_query)
     sparse_candidates: list[dict[str, Any]] = []
 
     if keywords:
@@ -846,7 +965,7 @@ def search_chunks_hybrid(
                 extra_params.append(max_security_level)
 
             # 1. PostgreSQL 전문 검색(FTS plainto_tsquery) 및 GIN 인덱스 활용 시도
-            fts_query_str = " ".join(keywords[:5])
+            fts_query_str = " ".join(keywords[:8])
             fts_conditions = ["to_tsvector('simple', c.content) @@ plainto_tsquery('simple', %s)"]
             if extra_conditions:
                 fts_conditions.extend(extra_conditions)
@@ -865,74 +984,93 @@ def search_chunks_hybrid(
             try:
                 fts_rows = connection.execute(fts_sql, [fts_query_str, fts_query_str, *extra_params]).fetchall()
             except Exception:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
                 fts_rows = []
 
-            if fts_rows:
-                for row in fts_rows:
-                    quality = row.get("quality_report") or {}
-                    sparse_candidates.append(
-                        {
-                            "id": row["id"],
-                            "document_id": row["document_id"],
-                            "source_name": row["source_name"],
-                            "chunk_index": row["chunk_index"],
-                            "text": row["content"],
-                            "metadata": row["metadata"] or {},
-                            "quality_score": quality.get("score"),
-                            "raw_matches": float(row.get("fts_score") or 1.0),
-                        }
-                    )
-            else:
-                # 2. FTS 결과 0건 시 기존 ILIKE 키워드 검색으로 안전하게 폴백함
-                kw_conditions: list[str] = []
-                kw_params: list[Any] = []
-                for kw in keywords[:5]:
-                    kw_conditions.append("c.content ILIKE %s")
-                    kw_params.append(f"%{kw}%")
+            for row in fts_rows:
+                quality = row.get("quality_report") or {}
+                sparse_candidates.append(
+                    {
+                        "id": row["id"],
+                        "document_id": row["document_id"],
+                        "source_name": row["source_name"],
+                        "chunk_index": row["chunk_index"],
+                        "text": row["content"],
+                        "metadata": row["metadata"] or {},
+                        "quality_score": quality.get("score"),
+                        "raw_matches": float(row.get("fts_score") or 1.0),
+                    }
+                )
 
-                where_parts = ["(" + " OR ".join(kw_conditions) + ")"]
-                if extra_conditions:
-                    where_parts.extend(extra_conditions)
-                where_sql = "WHERE " + " AND ".join(where_parts)
+            # FTS simple parser는 조사 결합 명사를 별도 어휘로 보지 못할 수 있어
+            # FTS 결과 유무와 관계없이 형태소 토큰의 부분 문자열 후보를 합침.
+            kw_conditions: list[str] = []
+            kw_params: list[Any] = []
+            for kw in keywords[:8]:
+                kw_conditions.append("c.content ILIKE %s")
+                kw_params.append(f"%{kw}%")
+            keyword_rank_sql = " + ".join(
+                "CASE WHEN c.content ILIKE %s THEN 1 ELSE 0 END" for _ in kw_conditions
+            )
+            keyword_rank_params = [f"%{kw}%" for kw in keywords[:8]]
 
-                sparse_query = f"""
-                    SELECT c.id, c.document_id, d.source_name, c.chunk_index, c.content,
-                           c.metadata, d.quality_report
-                    FROM rag_chunks c
-                    JOIN rag_documents d ON d.id = c.document_id
-                    {where_sql}
-                    LIMIT 30
-                """
-                rows = connection.execute(sparse_query, [*kw_params, *extra_params]).fetchall()
-                for row in rows:
-                    quality = row.get("quality_report") or {}
-                    text_lower = row["content"].lower()
-                    match_count = sum(1 for kw in keywords if kw.lower() in text_lower)
-                    sparse_candidates.append(
-                        {
-                            "id": row["id"],
-                            "document_id": row["document_id"],
-                            "source_name": row["source_name"],
-                            "chunk_index": row["chunk_index"],
-                            "text": row["content"],
-                            "metadata": row["metadata"] or {},
-                            "quality_score": quality.get("score"),
-                            "raw_matches": float(match_count),
-                        }
-                    )
-                sparse_candidates.sort(key=lambda x: x["raw_matches"], reverse=True)
+            where_parts = ["(" + " OR ".join(kw_conditions) + ")"]
+            if extra_conditions:
+                where_parts.extend(extra_conditions)
+            where_sql = "WHERE " + " AND ".join(where_parts)
+
+            sparse_query = f"""
+                SELECT c.id, c.document_id, d.source_name, c.chunk_index, c.content,
+                       c.metadata, d.quality_report, ({keyword_rank_sql}) AS keyword_score
+                FROM rag_chunks c
+                JOIN rag_documents d ON d.id = c.document_id
+                {where_sql}
+                ORDER BY keyword_score DESC
+                LIMIT 30
+            """
+            rows = connection.execute(
+                sparse_query,
+                [*keyword_rank_params, *kw_params, *extra_params],
+            ).fetchall()
+            candidates_by_id = {item["id"]: item for item in sparse_candidates}
+            for row in rows:
+                quality = row.get("quality_report") or {}
+                match_count = int(row.get("keyword_score") or 0)
+                candidate = candidates_by_id.get(row["id"])
+                if candidate is not None:
+                    candidate["raw_matches"] = max(float(candidate.get("raw_matches") or 0.0), float(match_count))
+                    continue
+                candidate = {
+                    "id": row["id"],
+                    "document_id": row["document_id"],
+                    "source_name": row["source_name"],
+                    "chunk_index": row["chunk_index"],
+                    "text": row["content"],
+                    "metadata": row["metadata"] or {},
+                    "quality_score": quality.get("score"),
+                    "raw_matches": float(match_count),
+                }
+                sparse_candidates.append(candidate)
+                candidates_by_id[row["id"]] = candidate
+
+            sparse_candidates.sort(key=lambda item: float(item.get("raw_matches") or 0.0), reverse=True)
         except Exception as exc:
             logger.warning("키워드 보조 검색 실패, 벡터 검색 결과만 사용: %s", exc)
         finally:
             connection.close()
 
+    sparse_candidates = bm25_rerank(normalized_query, sparse_candidates, text_key="text")
+
     # NOTE: 질의 특성(정확 키워드/조항/코드 vs 서술형 질의)에 따라 dense·sparse 가중치를 동적으로 조절함
     dense_weight = 1.0
     sparse_weight = 1.0
 
-    has_exact_quote = '"' in query_text or "'" in query_text
-    has_article_no = bool(re.search(r"제[0-9]+조", query_text))
-    has_specific_code = bool(re.search(r"[A-Z0-9_-]{4,}", query_text))
+    has_exact_quote = '"' in original_query_text or "'" in original_query_text
+    has_article_no = bool(re.search(r"제[0-9]+조", original_query_text))
+    has_specific_code = bool(re.search(r"[A-Z0-9_-]{4,}", original_query_text))
 
     if has_exact_quote or has_article_no or has_specific_code:
         sparse_weight = 1.4

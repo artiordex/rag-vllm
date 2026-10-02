@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
@@ -19,9 +20,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest_models
 
 from ..config import Settings
+from ..korean_search import bm25_rerank, normalize_korean_query, reciprocal_rank_fusion, tokenize_korean
 from .base import BaseVectorStore
 
 logger = logging.getLogger(__name__)
+_SPARSE_CANDIDATE_LIMIT = 2_000
+_SCROLL_PAGE_SIZE = 256
 
 
 class QdrantVectorStore(BaseVectorStore):
@@ -38,6 +42,8 @@ class QdrantVectorStore(BaseVectorStore):
         self.collection_name = collection_name
         self.dim = int(settings.embedding_dim)
         self._memory_mode = prefer_memory
+        self._init_lock = threading.Lock()
+        self._initialized = False
 
         # 로컬 Qdrant 인스턴스 또는 인메모리 클라이언트 초기화함
         if prefer_memory:
@@ -58,18 +64,46 @@ class QdrantVectorStore(BaseVectorStore):
 
     def initialize(self) -> None:
         """Qdrant 컬렉션이 없으면 새로 생성함"""
+        if self._initialized:
+            return
+        with self._init_lock:
+            if self._initialized:
+                return
+            self._initialize_collection()
+            self._initialized = True
+
+    def _initialize_collection(self) -> None:
         try:
             collections = self.client.get_collections().collections
             exists = any(c.name == self.collection_name for c in collections)
             if not exists:
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=rest_models.VectorParams(
-                        size=self.dim,
-                        distance=rest_models.Distance.COSINE,
-                    ),
-                )
-                logger.info("Qdrant 컬렉션 생성 완료: %s (차원: %d)", self.collection_name, self.dim)
+                try:
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=rest_models.VectorParams(
+                            size=self.dim,
+                            distance=rest_models.Distance.COSINE,
+                        ),
+                    )
+                except Exception:
+                    # 여러 worker가 동시에 최초 생성할 때 먼저 만든 collection을 재사용함.
+                    collections = self.client.get_collections().collections
+                    if not any(c.name == self.collection_name for c in collections):
+                        raise
+                logger.info("Qdrant 컬렉션 준비 완료: %s (차원: %d)", self.collection_name, self.dim)
+            if not self._memory_mode:
+                try:
+                    self.client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name="search_terms",
+                        field_schema=rest_models.PayloadSchemaType.KEYWORD,
+                        wait=True,
+                    )
+                except Exception:
+                    # 다른 worker가 같은 인덱스를 먼저 만든 경우는 정상으로 처리함.
+                    payload_schema = self.client.get_collection(self.collection_name).payload_schema or {}
+                    if "search_terms" not in payload_schema:
+                        raise
         except Exception as exc:
             raise ConnectionError("Qdrant 컬렉션을 초기화하지 못했습니다.") from exc
 
@@ -101,19 +135,32 @@ class QdrantVectorStore(BaseVectorStore):
         if len(chunks) != len(embeddings):
             raise ValueError("chunks와 embeddings의 개수가 다릅니다.")
         if replace_existing_source:
+            project_name = metadata.get("project_name")
+            replace_filter = [
+                rest_models.FieldCondition(
+                    key="source_name",
+                    match=rest_models.MatchValue(value=source_name),
+                )
+            ]
+            if project_name is not None:
+                replace_filter.append(
+                    rest_models.FieldCondition(
+                        key="project_name",
+                        match=rest_models.MatchValue(value=project_name),
+                    )
+                )
             self.client.delete(
                 collection_name=self.collection_name,
                 points_selector=rest_models.FilterSelector(
-                    filter=rest_models.Filter(
-                        must=[
-                            rest_models.FieldCondition(
-                                key="source_name",
-                                match=rest_models.MatchValue(value=source_name),
-                            )
-                        ]
-                    )
+                    filter=rest_models.Filter(must=replace_filter)
                 ),
             )
+            for existing_document_id, document in list(self._documents.items()):
+                if document.get("source_name") != source_name:
+                    continue
+                existing_project = (document.get("metadata") or {}).get("project_name")
+                if project_name is None or existing_project == project_name:
+                    self._documents.pop(existing_document_id, None)
         doc_id = document_id or uuid4()
         doc_str = str(doc_id)
         quality_score = int(quality_report.get("score") or 0)
@@ -148,6 +195,7 @@ class QdrantVectorStore(BaseVectorStore):
                 "project_name": meta.get("project_name"),
                 "security_level": meta.get("security_level", 1),
                 "quality_score": quality_score,
+                "search_terms": tokenize_korean(str(chunk_text)),
             }
             points.append(
                 rest_models.PointStruct(
@@ -176,6 +224,7 @@ class QdrantVectorStore(BaseVectorStore):
         project_name: str | None,
         department: str | None,
         max_security_level: int | None,
+        search_terms: list[str] | None = None,
     ) -> rest_models.Filter | None:
         """검색 조건에 맞는 Qdrant 필터 객체를 생성함"""
         must_conditions: list[Any] = []
@@ -222,6 +271,13 @@ class QdrantVectorStore(BaseVectorStore):
                 rest_models.FieldCondition(
                     key="security_level",
                     range=rest_models.Range(lte=float(max_security_level)),
+                )
+            )
+        if search_terms:
+            must_conditions.append(
+                rest_models.FieldCondition(
+                    key="search_terms",
+                    match=rest_models.MatchAny(any=search_terms),
                 )
             )
 
@@ -287,6 +343,61 @@ class QdrantVectorStore(BaseVectorStore):
             })
         return hits
 
+    def _search_keyword_candidates(
+        self,
+        *,
+        terms: list[str],
+        document_id: UUID | None,
+        document_ids: list[UUID] | None,
+        min_quality_score: int | None,
+        project_name: str | None,
+        department: str | None,
+        max_security_level: int | None,
+    ) -> list[dict[str, Any]]:
+        if not terms:
+            return []
+        query_filter = self._build_filter(
+            document_id=document_id,
+            document_ids=document_ids,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+            search_terms=terms,
+        )
+        candidates: list[dict[str, Any]] = []
+        offset: Any = None
+        try:
+            while len(candidates) < _SPARSE_CANDIDATE_LIMIT:
+                points, offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=query_filter,
+                    limit=min(_SCROLL_PAGE_SIZE, _SPARSE_CANDIDATE_LIMIT - len(candidates)),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    candidates.append({
+                        "chunk_id": point.id,
+                        "document_id": payload.get("document_id"),
+                        "chunk_index": payload.get("chunk_index"),
+                        "content": payload.get("content", ""),
+                        "source_name": payload.get("source_name"),
+                        "source_type": payload.get("source_type"),
+                        "metadata": payload.get("metadata", {}),
+                        "quality_score": payload.get("quality_score", 100),
+                        "cosine_similarity": 0.0,
+                        "combined_score": 0.0,
+                    })
+                if not points or offset is None:
+                    break
+        except Exception as exc:
+            logger.warning("Qdrant 형태소 키워드 검색 실패, dense 후보로 폴백합니다: %s", type(exc).__name__)
+            return []
+        return candidates
+
     def search_hybrid(
         self,
         *,
@@ -300,10 +411,14 @@ class QdrantVectorStore(BaseVectorStore):
         department: str | None = None,
         max_security_level: int | None = None,
     ) -> list[dict[str, Any]]:
-        """밀집 벡터 검색 결과와 텍스트 키워드 매칭 가중치를 결합하여 하이브리드 검색을 수행함"""
+        """dense 검색과 별도 형태소 키워드 검색을 RRF로 결합함"""
+        self.initialize()
+        normalized_query = normalize_korean_query(query_text)
+        terms = tokenize_korean(normalized_query)[:24]
+        dense_limit = max(20, top_k * 4)
         dense_hits = self.search(
             query_vector=query_vector,
-            top_k=max(15, top_k * 3),
+            top_k=dense_limit,
             document_id=document_id,
             document_ids=document_ids,
             min_quality_score=min_quality_score,
@@ -311,20 +426,34 @@ class QdrantVectorStore(BaseVectorStore):
             department=department,
             max_security_level=max_security_level,
         )
-
-        query_tokens = set(query_text.lower().split())
-
-        for hit in dense_hits:
-            content = str(hit.get("content", "")).lower()
-            keyword_matches = sum(1 for token in query_tokens if token in content)
-            sparse_score = keyword_matches / max(1, len(query_tokens))
-            vector_score = hit.get("cosine_similarity", 0.5)
-
-            # 밀집 점수와 키워드 점수의 가중합 산출함
-            hit["combined_score"] = round(vector_score * 0.7 + sparse_score * 0.3, 4)
-
-        dense_hits.sort(key=lambda x: x["combined_score"], reverse=True)
-        return dense_hits[:top_k]
+        keyword_hits = self._search_keyword_candidates(
+            terms=terms,
+            document_id=document_id,
+            document_ids=document_ids,
+            min_quality_score=min_quality_score,
+            project_name=project_name,
+            department=department,
+            max_security_level=max_security_level,
+        )
+        candidates_by_id: dict[str, dict[str, Any]] = {}
+        for hit in [*dense_hits, *keyword_hits]:
+            identity = hit.get("chunk_id")
+            if identity is not None:
+                candidates_by_id.setdefault(str(identity), hit)
+        lexical_ranked = bm25_rerank(
+            normalized_query,
+            list(candidates_by_id.values()),
+            text_key="content",
+        )
+        lexical_hits = [
+            hit for hit in lexical_ranked
+            if float(hit.get("lexical_overlap") or 0.0) > 0.0
+        ]
+        return reciprocal_rank_fusion(
+            [dense_hits, lexical_hits],
+            top_k=top_k,
+            weights=[1.0, 1.2],
+        )
 
     def delete_document(self, document_id: UUID) -> bool:
         """지정된 문서의 모든 청크 포인트를 필터 조건으로 삭제함"""

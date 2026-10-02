@@ -10,6 +10,7 @@
 """다중 벡터 저장소 인터페이스 패키지 초기화함"""
 
 from .base import BaseVectorStore
+from .cpp_engine_store import CppEngineVectorStore
 from .factory import get_vector_store
 from .pgvector_store import PgVectorStore
 from .qdrant_store import QdrantVectorStore
@@ -17,6 +18,7 @@ from .weaviate_store import WeaviateVectorStore
 
 __all__ = [
     "BaseVectorStore",
+    "CppEngineVectorStore",
     "PgVectorStore",
     "QdrantVectorStore",
     "WeaviateVectorStore",

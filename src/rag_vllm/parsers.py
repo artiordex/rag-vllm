@@ -112,34 +112,83 @@ def _decode_bytes(payload: bytes) -> str:
 
 
 def _parse_pdf(payload: bytes) -> ParsedDocument:
-    """PDF 페이지별 텍스트를 추출하고 페이지·문자 수 한도를 검증함
+    """PDF 텍스트와 표 행을 추출하고 페이지·문자 수 한도를 검증함
 
     Raises:
         ParseError: 의존성·페이지 수·추출 문자 수·PDF 구조가 허용 범위를
             벗어날 때 발생함
     """
+    parser_name = "pypdf"
     try:
-        from pypdf import PdfReader
-    except ImportError as exc:  # NOTE: 선언된 PDF 의존성이 테스트 환경에서 누락된 경우만 해당함
-        raise ParseError("PDF 파싱을 위해 pypdf를 설치해야 합니다.") from exc
+        import pdfplumber
+    except ImportError:
+        pdfplumber = None
 
     try:
-        reader = PdfReader(BytesIO(payload))
-        if len(reader.pages) > MAX_PDF_PAGES:
-            raise ParseError(f"PDF 페이지 수가 허용 한도({MAX_PDF_PAGES})를 초과했습니다.")
         pages: list[str] = []
         extracted_characters = 0
-        for page_number, page in enumerate(reader.pages, start=1):
-            page_text = normalize_text(page.extract_text() or "")
-            if page_text:
-                pages.append(page_text)
-                extracted_characters += len(page_text)
-                if extracted_characters > MAX_TEXT_CHARACTERS:
-                    raise ParseError("PDF에서 추출한 텍스트가 허용 한도를 초과했습니다.")
-        is_scanned = len(pages) == 0 or (extracted_characters < 20 * len(reader.pages))
+        table_count = 0
+        if pdfplumber is not None:
+            parser_name = "pdfplumber"
+            with pdfplumber.open(BytesIO(payload)) as pdf:
+                page_count = len(pdf.pages)
+                if page_count > MAX_PDF_PAGES:
+                    raise ParseError(f"PDF 페이지 수가 허용 한도({MAX_PDF_PAGES})를 초과했습니다.")
+                for page_number, page in enumerate(pdf.pages, start=1):
+                    page_parts: list[str] = []
+                    tables = page.find_tables() or []
+                    table_regions = [table.bbox for table in tables]
+                    text_page = page
+                    if table_regions:
+                        text_page = page.filter(
+                            lambda item: item.get("object_type") != "char"
+                            or not any(
+                                x0 <= (item.get("x0", 0) + item.get("x1", 0)) / 2 <= x1
+                                and top <= (item.get("top", 0) + item.get("bottom", 0)) / 2 <= bottom
+                                for x0, top, x1, bottom in table_regions
+                            )
+                        )
+                    page_text = normalize_text(text_page.extract_text(layout=True) or "")
+                    if page_text:
+                        page_parts.append(page_text)
+                    for table in tables:
+                        rows = [[str(cell or "").strip().replace("\n", " ") for cell in row] for row in table.extract()]
+                        rows = [row for row in rows if any(row)]
+                        if not rows:
+                            continue
+                        table_count += 1
+                        width = max(len(row) for row in rows)
+                        rows = [row + [""] * (width - len(row)) for row in rows]
+                        page_parts.extend("| " + " | ".join(row) + " |" for row in rows[:1])
+                        page_parts.append("| " + " | ".join("---" for _ in range(width)) + " |")
+                        page_parts.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+                    combined_page = normalize_text("\n".join(page_parts))
+                    if combined_page:
+                        pages.append(f"[페이지 {page_number}]\n{combined_page}")
+                        extracted_characters += len(combined_page)
+                        if extracted_characters > MAX_TEXT_CHARACTERS:
+                            raise ParseError("PDF에서 추출한 텍스트가 허용 한도를 초과했습니다.")
+        else:
+            from pypdf import PdfReader
+
+            reader = PdfReader(BytesIO(payload))
+            page_count = len(reader.pages)
+            if page_count > MAX_PDF_PAGES:
+                raise ParseError(f"PDF 페이지 수가 허용 한도({MAX_PDF_PAGES})를 초과했습니다.")
+            for page_number, page in enumerate(reader.pages, start=1):
+                page_text = normalize_text(page.extract_text() or "")
+                if page_text:
+                    pages.append(f"[페이지 {page_number}]\n{page_text}")
+                    extracted_characters += len(page_text)
+                    if extracted_characters > MAX_TEXT_CHARACTERS:
+                        raise ParseError("PDF에서 추출한 텍스트가 허용 한도를 초과했습니다.")
+
+        is_scanned = page_count == 0 or (extracted_characters < 20 * page_count)
         pdf_metadata: dict[str, object] = {
-            "page_count": len(reader.pages),
+            "page_count": page_count,
+            "table_count": table_count,
             "is_scanned_pdf": is_scanned,
+            "layout_parser": parser_name,
         }
         if is_scanned and not pages:
             from .multimodal import extract_visual_elements_from_pdf
@@ -147,7 +196,7 @@ def _parse_pdf(payload: bytes) -> ParsedDocument:
             visual_elements = extract_visual_elements_from_pdf(payload)
             pdf_metadata["visual_elements_count"] = len(visual_elements)
             pages.append(
-                f"[스캔 PDF 문서: 총 {len(reader.pages)}페이지]\n"
+                f"[스캔 PDF 문서: 총 {page_count}페이지]\n"
                 "- 텍스트 레이어가 없어 OCR 또는 멀티모달 분석이 필요합니다."
             )
     except ParseError:

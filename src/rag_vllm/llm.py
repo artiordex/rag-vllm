@@ -64,7 +64,16 @@ class LLMClient:
         """채팅 호출에 필요한 기본 URL과 모델이 모두 설정됐는지 반환함"""
         return bool(self.settings.llm_base_url and self.settings.llm_model)
 
-    def complete(self, question: str, context: str, system_prompt: str | None = None) -> str | None:
+    def complete(
+        self,
+        question: str,
+        context: str,
+        system_prompt: str | None = None,
+        *,
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str = "rag-vllm-response",
+        lora_name: str | None = None,
+    ) -> str | None:
         """검색 근거를 벗어나지 않도록 질문과 문맥으로 답변을 생성함
 
         Args:
@@ -85,6 +94,14 @@ class LLMClient:
         if not self.configured:
             return None
 
+        model_name = self.settings.llm_model
+        if lora_name is not None:
+            adapters = dict(self.settings.llm_lora_adapters)
+            if lora_name not in adapters:
+                raise ValueError("요청한 LoRA 별칭이 서버 허용 목록에 없습니다.")
+            # vLLM OpenAI 호환 API는 배포된 어댑터 이름을 model 필드로 받음.
+            model_name = adapters[lora_name]
+
         base_url = self.settings.llm_base_url.rstrip("/")  # type: ignore[union-attr]
         endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -100,7 +117,7 @@ class LLMClient:
             )
         user_content = f"CONTEXT:\n{context}\n\nQUESTION:\n{question}" if context.strip() else question
         payload: dict[str, Any] = {
-            "model": self.settings.llm_model,
+            "model": model_name,
             "temperature": 0,
             # NOTE: Qwen3 기본 추론 흔적은 RAG 답변에 불필요하므로 간결한 응답을 요청함
             "chat_template_kwargs": {"enable_thinking": False},
@@ -109,6 +126,17 @@ class LLMClient:
                 {"role": "user", "content": user_content},
             ],
         }
+        if response_schema is not None:
+            # vLLM의 OpenAI 호환 API는 이 표준 response_format을 엔진의
+            # structured output 제약으로 변환함. 지원하지 않는 서버는 실패 처리함.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema_name,
+                    "schema": response_schema,
+                    "strict": True,
+                },
+            }
         try:
             # SECURITY: 지속 커넥션 풀을 활용해 TCP 핸드셰이크 오버헤드를 줄임
             client = get_shared_llm_client(self.settings.llm_timeout_seconds)
@@ -125,6 +153,8 @@ class LLMClient:
         question: str,
         context: str,
         system_prompt: str | None = None,
+        *,
+        lora_name: str | None = None,
     ) -> Any:
         """검색 근거와 질문으로 vLLM 토큰 스트리밍 생성을 수행함
 
@@ -133,6 +163,13 @@ class LLMClient:
         """
         if not self.configured:
             return
+
+        model_name = self.settings.llm_model
+        if lora_name is not None:
+            adapters = dict(self.settings.llm_lora_adapters)
+            if lora_name not in adapters:
+                raise ValueError("요청한 LoRA 별칭이 서버 허용 목록에 없습니다.")
+            model_name = adapters[lora_name]
 
         import json
 
@@ -151,7 +188,7 @@ class LLMClient:
             )
         user_content = f"CONTEXT:\n{context}\n\nQUESTION:\n{question}" if context.strip() else question
         payload: dict[str, Any] = {
-            "model": self.settings.llm_model,
+            "model": model_name,
             "temperature": 0,
             "stream": True,
             "chat_template_kwargs": {"enable_thinking": False},

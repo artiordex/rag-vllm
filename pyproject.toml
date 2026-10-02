@@ -20,14 +20,22 @@ dependencies = [
     "pillow>=12.3.0",
     "openpyxl>=3.1.5",
     "olefile>=0.47",
+    "pdfplumber>=0.11.10",
     "qdrant-client>=1.19.1",
+    "kiwipiepy>=0.24.0,<0.25.0",
+    "rank-bm25>=0.2.2",
+    "weaviate-client>=4.23.0,<5.0.0",
     "transformers>=5.17.0",
     "peft>=0.21.0",
     "accelerate>=1.15.0",
     "datasets>=5.0.1",
     "sentence-transformers>=6.1.0",
     "deepeval>=4.2.7",
+    "duckdb>=1.5.0,<2.0.0",
 ]
+
+[project.optional-dependencies]
+redis-cache = ["redis>=5.2.0,<8.0.0"]
 
 [project.scripts]
 rag-vllm = "rag_vllm:main"

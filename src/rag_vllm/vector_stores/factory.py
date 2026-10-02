@@ -12,16 +12,18 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import threading
 from ..config import Settings
 from .base import BaseVectorStore
+from .cpp_engine_store import CppEngineVectorStore
 from .pgvector_store import PgVectorStore
 from .qdrant_store import QdrantVectorStore
 from .weaviate_store import WeaviateVectorStore
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_STORES: dict[tuple[str, str, str, str, int], BaseVectorStore] = {}
+_GLOBAL_STORES: dict[tuple[str, str, str, str, int, str, int, str, int, str], BaseVectorStore] = {}
 _STORE_LOCK = threading.Lock()
 
 
@@ -42,13 +44,18 @@ def get_vector_store(settings: Settings, store_type_override: str | None = None)
         settings.qdrant_url,
         settings.weaviate_url,
         int(settings.embedding_dim),
+        settings.cpp_engine_library,
+        int(settings.cpp_engine_max_vectors),
+        settings.weaviate_grpc_host,
+        int(settings.weaviate_grpc_port),
+        hashlib.sha256((settings.weaviate_api_key or "").encode("utf-8")).hexdigest(),
     )
     store = _GLOBAL_STORES.get(cache_key)
-    if store is not None:
+    if store is not None and (engine != "cpp_engine" or store.health_check()):
         return store
     with _STORE_LOCK:
         store = _GLOBAL_STORES.get(cache_key)
-        if store is None:
+        if store is None or (engine == "cpp_engine" and not store.health_check()):
             store = _create_store(engine, settings)
             _GLOBAL_STORES[cache_key] = store
     return store
@@ -69,5 +76,10 @@ def _create_store(engine: str, settings: Settings) -> BaseVectorStore:
     elif engine == "pgvector":
         logger.info("기본 pgvector 저장소 활성화됨")
         store = PgVectorStore(settings)
+        return store
+    elif engine == "cpp_engine":
+        logger.info("사내 C++ 인메모리 벡터 저장소 활성화됨")
+        store = CppEngineVectorStore(settings)
+        store.initialize()
         return store
     raise ValueError(f"지원하지 않는 벡터 저장소 유형입니다: {engine}")

@@ -1,6 +1,6 @@
 # rag-vllm
 
-vLLM과 PostgreSQL/pgvector를 사용하는 문서 수집, 로컬 휴리스틱 품질진단, 근거 검색, 문서 초안 생성 API다. `rag-ollama`를 개인 학습에 쓰고 이 프로젝트를 품질진단·RAG·문서 자동화에 쓰는 구성을 기준으로 한다.
+vLLM과 PostgreSQL/pgvector를 기본으로 사용하는 문서 수집, 로컬 휴리스틱 품질진단, 근거 검색, 문서 초안 생성 API다. `rag-ollama`를 개인 학습에 쓰고 이 프로젝트를 품질진단·RAG·문서 자동화에 쓰는 구성을 기준으로 한다.
 
 ## 지원 범위와 판단 한계
 
@@ -11,6 +11,8 @@ vLLM과 PostgreSQL/pgvector를 사용하는 문서 수집, 로컬 휴리스틱 �
 
 rag-vllm의 점수는 내부 휴리스틱이다. 공식 공공데이터 품질평가, 개인정보 비식별 확인, 공식 표준사전 일치, 문서 공개 승인으로 해석하면 안 된다. OCR 정확도(CER/WER), 원본과 추출 구조의 보존율, 저작권, 모집단 성공률은 측정하지 않는다. 스캔 PDF에는 OCR을 실행하지 않는다. 이미지 파서는 Tesseract가 설치되고 언어팩이 있을 때에만 OCR을 시도하며, 그 외에는 이미지 정보 안내문을 색인한다.
 
+텍스트 PDF는 `pdfplumber`의 레이아웃 추출과 표 행 추출을 사용한다. 추출 결과는 원본 페이지와 표의 완전한 시각적 보존을 보장하지 않으며 스캔 PDF의 OCR도 수행하지 않는다. HWP 5.0은 현재 `olefile` 기반 로컬 OLE/압축 섹션 파서를 사용한다. `pyhwp`는 오래된 Python 호환 범위와 AGPL 라이선스를 별도 검토하기 전까지 의존성에 추가하지 않았다.
+
 ## 저장 및 텍스트 처리
 
 `/documents/file`은 원본 파일 바이트를 별도 보관하지 않고, 추출·정규화된 텍스트를 데이터베이스에 저장한다. 기본값인 `INGEST_AUTO_MASK_PII=true`에서는 휴리스틱 패턴으로 찾은 일부 문자열을 가린 파생 텍스트가 저장된다. 이 설정은 새 등록에 적용되며 기존 문서·청크를 소급해 바꾸지 않는다. 패턴은 모든 개인정보를 찾거나 비식별성을 보장하지 않는다. 이 설정을 `false`로 두면 식별 정보가 포함된 정규화 텍스트가 그대로 저장될 수 있다.
@@ -20,6 +22,34 @@ rag-vllm의 점수는 내부 휴리스틱이다. 공식 공공데이터 품질�
 API 업로드 기본 한도는 20 MiB다. PDF는 최대 2,000페이지, DOCX/HWPX 압축 파일은 멤버·압축 해제 크기 제한을 두고, 이미지는 최대 40,000,000픽셀까지 허용한다. 파서 결과와 직접 텍스트 진단은 최대 5,000,000자다. 한도를 넘거나 지원하지 않는 문서는 오류로 반환한다. FastAPI의 multipart 파싱 뒤 라우트 한도가 적용되므로, 네트워크에 노출할 때는 앞단 프록시에도 요청 본문 크기 제한을 설정한다.
 
 `POST /quality/structured`의 `structured-local-v3`는 표본 형식을 추정해 날짜의 달력 유효성과 행 간 컬럼 구성을 살핀다. 행의 값 개수가 헤더와 다르면 스키마 불일치로 집계하고 누락 칸은 결측으로 반영한다. CSV/레코드 입력은 최대 100,000행, 512컬럼, 1,000,000셀로 제한한다. 날짜 형식 추정이 업무별 기준을 대체하지 않으며 결과 점수는 참고용이다.
+
+## 검색 및 집계 라우팅 고도화
+
+다음 기능은 환경변수로 독립 활성화한다. `CONTEXTUAL_RETRIEVAL_ENABLED=true`는 제목, 기존 메타데이터의 `summary`, 청크의 섹션 경로를 **임베딩 입력에만** 붙인다. 원문 청크는 그대로 저장한다. 이미 색인한 문서는 재색인해야 새 문맥 임베딩이 적용된다. 자동 요약 모델 호출은 하지 않는다.
+
+`MULTI_QUERY_ENABLED=true`는 비교·복합 질문을 최대 3개의 근거가 확인된 하위 질의로 계획하고, 저장소 검색을 병렬 실행한 뒤 RRF로 합친다. 답변 생성에는 원래 질문을 사용한다. 하위 계획이 유효하지 않거나 LLM이 없으면 원 질문 검색으로 돌아간다.
+
+`CRAG_ENABLED=true`는 검색 후 질문과 상위 청크의 형태소 근거를 검사한다. 현재 저장소별 점수는 보정된 확률이 아니므로 이 값을 임계치로 간주하지 않는다. 어휘 근거가 부족하면 생성 단계를 건너뛰고 근거 부족을 반환한다. 이는 정답성 증명기가 아니며, 배포 전에 도메인 질의로 거절률과 누락률을 확인한다.
+
+### 분산 시맨틱 캐시
+
+기본 캐시는 프로세스 메모리에서 동작한다. 워커 간 공유와 재시작 후 보존이 필요하면 `uv sync --extra redis-cache`로 Redis 클라이언트를 설치하고 `SEMANTIC_CACHE_REDIS_URL=rediss://...`를 설정한다. Redis 캐시는 보안·프로젝트·문서 범위 및 모델 설정을 포함한 별도 키, TTL, 범위별 항목 제한을 사용한다. 인제스트/삭제 시 캐시 세대를 변경해 이전 답변을 무효화한다. Redis 장애나 클라이언트 미설치는 질의 실패 대신 로컬 메모리 캐시로 폴백한다. Redis에는 생성 답변과 인용 문맥 일부가 저장되므로 내부 접근 제한, TLS, 서버 maxmemory/eviction 정책을 설정한다. `/chat/query`의 앱 전용 질의는 캐시를 사용하지 않는다.
+
+### 구조화 데이터 DuckDB 질의
+
+`query_mode=auto`가 기본값이다. `document_id`가 지정된 CSV/TSV/XLSX에 집계 의도(평균·합계·건수·비율·최소/최대 등)가 분명하면 `/query`와 `/query/stream`은 DuckDB로 자동 라우팅한다. 문서 설명처럼 검색이 필요한 질문은 `query_mode="retrieval"`로 일반 RAG를 선택할 수 있다. `POST /query/structured`는 JSON 레코드, CSV 본문 또는 등록된 표 문서를 직접 지정하는 경로다. XLSX는 문서 파서가 만든 Markdown 표를 사용하며 다중 시트는 `table_index`로 고른다. LLM은 컬럼만 포함한 집계 계획 JSON을 만들고, 서버는 허용된 `count/sum/avg/min/max`, 그룹, 제한된 필터만 SQL로 컴파일한다. 임의 SQL이나 파일 경로는 받지 않는다. 외부 파일 접근은 테이블 적재 후 DuckDB 연결에서 끈다. 이 경로는 CSV/TSV/XLSX 표를 매 요청 처리하며 DuckDB에 업로드 데이터를 영속 저장하지 않는다.
+
+```bash
+curl -X POST http://localhost:11020/query/structured \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"학교별 평균 급식 단가를 계산해줘","records":[{"학교":"한빛초","급식 단가":4500},{"학교":"한빛초","급식 단가":5500},{"학교":"샘물중","급식 단가":6000}]}'
+```
+
+앱별 RAG 자격증명은 고정된 `project_name` 안의 표 문서에만 `POST /chat/query/structured`로 질의할 수 있다. 요청은 `question`, `document_id`, 선택적 `table_index`로 제한된다. 앱 프로젝트 범위는 서버 자격증명에서 가져오며 호출자가 바꾸지 못한다.
+
+### 요청별 vLLM LoRA 선택
+
+vLLM에 시작 시 등록한 어댑터만 요청별로 선택한다. `compose.yaml`의 LoRA 인자를 활성화하고 어댑터 경로를 지정한다. 예를 들어 서버를 `--enable-lora --lora-modules moe-standard-v1=/root/lora-adapters/moe-standard-v1`로 실행하고 `.env`에 `LLM_LORA_ADAPTERS_JSON='{"moe-standard-v1":"moe-standard-v1"}'`를 설정한다. `/query` 또는 `/query/stream` 요청에 `"lora_name":"moe-standard-v1"`을 보낸다. rag-vllm은 허용 목록 별칭을 vLLM OpenAI API의 `model` 필드로 매핑한다. 등록되지 않은 별칭은 거부한다. 어댑터의 동적 로드·언로드 API는 노출하지 않는다.
 
 ## GPU 및 모델 설정
 
@@ -40,7 +70,28 @@ uv run rag-vllm-api
 
 기본 포트는 vLLM `11435`, rag-vllm API `11020`이다. API는 호스트에서 실행하므로 `.env`의 `LLM_BASE_URL=http://127.0.0.1:11435/v1` 설정으로 vLLM 컨테이너에 연결한다.
 
-API는 기본적으로 localhost에서만 듣는다. LAN에서 접근시키려면 `.env`에 `API_HOST=0.0.0.0`과 충분히 강한 `RAG_LAB_API_KEY`를 설정하고, 신뢰된 호출 출처만 방화벽/CORS에 허용한다. API 키는 암호화되지 않은 HTTP에서 평문으로 전송되므로 LAN 접근은 VPN 안에서 사용하거나 TLS 종료 프록시 뒤에 둔다. 대시보드 페이지에서 키를 입력하면 현재 페이지 메모리에만 보관하고 API 요청에 `X-API-Key`를 붙인다. 페이지를 새로고침하면 다시 입력해야 한다. 서버 API와 `/health`는 키를 확인하며, HTML 대시보드 페이지는 키 입력을 위해 공개 제공된다. 외부 네트워크에 인증 없이 노출하지 않는다.
+RAG-vLLM은 앱 서버가 호출하는 API로 운영한다. `.env.example`은 인증되지 않은 개발 대시보드를 `RAG_DASHBOARD_ENABLED=false`로 비활성화한다. 로컬 운영자가 필요할 때만 신뢰된 개발 환경에서 `RAG_DASHBOARD_ENABLED=true`로 켠다. API는 기본적으로 localhost에서만 듣는다. LAN에서 접근시키려면 `.env`에 `API_HOST=0.0.0.0`과 충분히 강한 `RAG_LAB_API_KEY`를 설정하고, 신뢰된 호출 출처만 방화벽/CORS에 허용한다. API 키는 암호화되지 않은 HTTP에서 평문으로 전송되므로 LAN 접근은 VPN 안에서 사용하거나 TLS 종료 프록시 뒤에 둔다.
+
+### 내부 앱의 챗봇 연결
+
+`POST /chat/query`는 `internal-nas`, `internal-portal`, `food-safety` 같은 앱에서 서버 간 호출로 사용한다. 일반 `/query`와 달리 요청은 `question`, 선택적 `top_k`, 선택적 `generate_answer`만 받으며, 답변 생성은 기본값 `true`다. `generate_answer=false`이면 LLM 답변 생성 없이 해당 범위의 검증된 검색 출처만 반환하므로 MOE 품질 지침 검색에 사용한다. 검색은 요청 본문이 아닌 RAG 서버 자격 설정에서 정한 단일 `project_name` 범위로 제한된다. `X-RAG-Client-ID`는 앱 이름, `X-API-Key`는 그 앱 전용 비밀 키다. 앱별 키는 32자 이상이어야 하며 프런트엔드에 전달하지 않는다. 같은 query 권한 키로 `GET /chat/health`에서 데이터베이스 준비 상태를 확인할 수 있다. 이 경로는 최소한의 `status`와 `database` 상태만 반환한다.
+
+`POST /chat/ingest`는 `ingest` 권한이 있는 앱 자격증명으로 승인된 파생 텍스트를 해당 앱 코퍼스에 넣는다. 본문은 `name`, `text`, 선택적 `replace_existing_source`로 제한하며, 호출자가 보낸 메타데이터나 `project_name`은 받지 않는다. RAG 서버가 코퍼스 범위와 문서 출처 유형을 지정하고 휴리스틱 개인정보 마스킹을 강제한다. 파생본은 앱 서버에서 검토·승인한 뒤 보내며, 원본 경로나 사용자 개인 폴더를 문서 이름으로 쓰지 않는다. 응답은 문서 ID, 청크 수와 품질 점수·등급·개인정보 후보 개수만 반환하고 위치·추천·용어 상세는 제외한다. `POST /chat/delete`는 `delete` 권한이 있는 앱만 같은 앱 코퍼스의 정확히 일치하는 출처 이름을 제거할 수 있어 승인 취소나 파일 삭제 이벤트에 사용할 수 있다. 삭제 후 해당 출처가 없으면 `deleted: true`를 반환하므로 타임아웃 뒤 재시도도 안전하다. 권한 목록을 생략하면 `query`만 허용한다.
+
+같은 앱 프로젝트와 출처 이름에 대한 색인 교체·삭제는 PostgreSQL advisory lock으로 직렬화하며, 잠금 대기는 30초에서 끝나 대기 중인 요청이 API 작업자를 무기한 점유하지 않는다. 외부 Qdrant·Weaviate에서 검색한 청크도 반환 전에 PostgreSQL의 현재 문서 ID와 프로젝트 범위에 대조하므로, 교체·삭제 도중 남은 고아 벡터는 앱 응답에 포함되지 않는다.
+
+서버 환경에 다음과 같은 JSON을 설정한다. 각 앱에는 서로 다른 무작위 키를 만들고 비밀 저장소나 서버 환경변수로 전달한다. 아래의 예시 키는 실제 운영 키로 사용하지 않는다.
+
+```bash
+python -c 'import secrets; print(secrets.token_urlsafe(48))'
+RAG_CHAT_CLIENTS_JSON='{"internal-nas":{"token":"replace-with-a-generated-nas-token-at-least-32-characters","project_name":"internal-nas","permissions":["query","ingest","delete"]},"internal-portal":{"token":"replace-with-a-generated-portal-token-at-least-32-characters","project_name":"internal-portal","permissions":["query"]},"food-safety":{"token":"replace-with-a-generated-food-token-at-least-32-characters","project_name":"food-safety","permissions":["query","ingest"]},"moe-dq-diag":{"token":"replace-with-a-generated-moe-token-at-least-32-characters","project_name":"moe_dq_diag","permissions":["query"]}}'
+```
+
+설명용 자리표시자는 서비스에 적용하기 전에 각각 별도로 생성한 무작위 토큰으로 바꾼다.
+
+각 앱의 서버는 `POST http://<rag-vllm 주소>:11020/chat/query`에 JSON `{"question":"...","top_k":5}`와 `X-RAG-Client-ID`, `X-API-Key` 헤더를 보낸다. 응답은 일반 검색/RAG의 `answer`, `sources`, `confidence_score`, `hallucination_risk`, 가드레일 필드를 포함한다. LMOps 일반 설정이 바뀌어도 이 경로는 질문·답변 원문을 저장하지 않으며 시맨틱 캐시도 사용하지 않는다. 앱 질의는 길이만 남기는 요약 감사 로그를 사용한다. 권한은 앱마다 최소화한다. NAS에는 query/ingest/delete, food-safety에는 query/ingest, internal-portal과 moe-dq-diag에는 query만 부여한다. `project_name`과 허용 작업은 클라이언트가 바꿀 수 없다.
+
+이 앱별 범위는 코퍼스 분리이며 사용자별 파일 권한 검사가 아니다. 해당 프로젝트 이름으로 승인된 공용 자료만 색인해야 한다. 예를 들어 NAS의 사용자 폴더 파일은 파일 ACL을 질의에 연결하기 전까지 색인하지 않고, 승인된 마스킹 파생본만 공용 지식 범위에 넣는다. `moe_dq_diag`는 규칙 설명과 검토 절차 같은 승인 문서를 별도 검색할 수 있지만, RAG 결과는 진단 점수·비교 적격성·공식 판정을 바꾸지 않는 보조 근거로만 표시한다. 브라우저에서 rag-vllm을 직접 호출하거나 앱 키를 브라우저에 제공하지 않는다. TLS 또는 내부 VPN으로 전송 경로를 보호한다.
 
 `department`와 `max_security_level` 질의 값은 검색 범위를 좁히는 호출자 지정 필터다. 이 API 키는 사용자 신원이나 문서별 권한을 구분하지 않으므로, 해당 필터를 접근통제로 간주하지 않는다. 민감 문서를 여러 사용자에게 제공하려면 인증된 서버 주체에서 권한을 계산하고 DB 질의에 적용하는 구성이 추가되어야 한다.
 
@@ -179,6 +230,15 @@ curl --get http://localhost:11020/quality/moe/c2-term-matches \
 
 업로드는 rag-vllm의 `MAX_UPLOAD_BYTES`와 MOE 연동 25 MiB 중 더 작은 한도까지만 전달하고, rag-vllm DB에는 저장하지 않는다. 원본 파일명 대신 확장자만 전달하며, 응답에서 원문 샘플 필드를 제거한다. MOE 개발 API도 임시 파싱 후 파일을 지운다. `/quality/moe/unstructured`는 같은 업로드를 MOE의 임시 진단 API와 rag-vllm의 로컬 텍스트 기준 진단기에 각각 전달한다. 결과는 MOE `report`와 `local_comparison.rag_vllm` 아래에 분리해 반환하며, 두 점수는 측정 범위가 달라 비교·합산하지 않는다. rag-vllm 파서가 해당 파일을 읽지 못하면 MOE 결과를 유지하고 로컬 비교만 `available=false`로 표시한다. 어느 결과도 rag-vllm DB에 저장하지 않는다. 두 번째 경로는 기존 C-2 테이블 컬럼명 후보만 읽는다. 문서 본문 임의 용어의 승인된 표준화 검증 기능은 아직 없으며, 두 결과를 하나의 공식 판정으로 사용하지 않는다. `RAG_LAB_API_KEY`를 설정했다면 예시 헤더의 값을 실제 키로 바꾸고, 키를 설정하지 않았다면 헤더 두 줄을 생략한다.
 
+`POST /quality/moe/unstructured/compare`는 `original_file`과 `cleaned_file` 두 업로드를 MOE의 개발 전용 임시 비교 경로에 전달한다. 파일별 최대 크기는 rag-vllm 설정과 25 MiB 중 작은 값이다. 응답은 해시, 파서·규칙 버전, 측정 가능한 차원, 규칙 ID의 해결·추가·잔여 집합을 제공하며, 형식이나 처리 버전이 다르면 이슈 변화는 미측정으로 표시한다. RAG는 파일명과 원문을 보내거나 파일을 저장하지 않으며 공식 품질 승인 판정을 만들지 않는다.
+
+```bash
+curl -X POST http://localhost:11020/quality/moe/unstructured/compare \
+  -H 'X-API-Key: replace-with-the-value-from-RAG_LAB_API_KEY' \
+  -F 'original_file=@./original.pdf' \
+  -F 'cleaned_file=@./cleaned.pdf'
+```
+
 C-2 프록시 결과에는 표준사전 `dictionaryVersions`, 검토 상태 `decisionStatus`, 원천 행 읽기 수, DB 쓰기 수가 포함된다. 기대한 버전·검토·읽기 전용 계약이 빠지면 응답을 거부한다.
 
 로컬 개발 환경에서 직접 호출할 때는 `moe_dq_diag` Compose의 호스트 포트 `8001`을 사용한다 (`8001` → 컨테이너 `8000`). FastAPI를 직접 실행했다면 `8000`을 사용한다. 아래 명령은 파일을 개발 전용 임시 진단 경로에 보내며 저장·승인하지 않는다.
@@ -236,10 +296,12 @@ curl --get http://localhost:8001/api/v1/standardization/term-matches \
 - **API**: `GET /lmops/traces`, `GET /lmops/metrics/summary`, `POST /lmops/feedback`, `POST /lmops/export-sft`
 
 ### 5. 다중 벡터 저장소 추상화 인터페이스 (`src/rag_vllm/vector_stores/`)
-- **공통 인터페이스 (`BaseVectorStore`)**: PostgreSQL을 문서 메타데이터의 기준 저장소로 유지하고, 선택된 벡터 엔진에도 동일 문서 ID와 청크 임베딩을 기록한다. 검색·스트리밍·삭제는 `VECTOR_STORE_TYPE` 설정을 따른다. 하이브리드 점수 결합은 pgvector의 FTS+벡터 RRF와 다른 엔진의 dense+키워드 가중합으로 구분된다.
+- **공통 인터페이스 (`BaseVectorStore`)**: PostgreSQL을 문서 메타데이터의 기준 저장소로 유지하고, 선택된 벡터 엔진에도 동일 문서 ID와 청크 임베딩을 기록한다. 검색·스트리밍·삭제는 `VECTOR_STORE_TYPE` 설정을 따른다. pgvector는 FTS+벡터 후보를 RRF로 결합하고, Qdrant와 C++ 엔진은 dense 후보와 Kiwi 키워드 후보를 BM25·RRF로 결합하며, Weaviate는 서버 네이티브 hybrid 검색을 사용한다.
 - **지원 엔진**:
   - `PgVectorStore`: 기존 PostgreSQL 16 + pgvector 기반 하이브리드 FTS 검색 연동 (기본값).
   - `QdrantVectorStore`: Qdrant 서버의 영구 컬렉션에 저장한다. 서버 연결 실패 시 메모리 저장소로 조용히 전환하지 않고 요청을 실패시킨다.
-  - `WeaviateVectorStore`: Weaviate REST API에 객체를 저장하고 GraphQL `nearVector` 검색을 사용한다. 서버 연결이 필요하다.
-- **설정 변경**: `.env`의 `VECTOR_STORE_TYPE=pgvector|qdrant|weaviate`. Qdrant/Weaviate 서버를 별도로 실행하고 URL을 설정한다. 요청별 엔진 변경은 지원하지 않으며 색인에 사용한 설정과 질의 엔진을 일치시킨다. 엔진을 바꾸면 기존 문서를 다시 인제스트해 새 벡터 색인을 채운다.
+  - `WeaviateVectorStore`: 공식 `weaviate-client` v4와 gRPC 배치 업로드·near-vector·hybrid 검색을 사용한다. Weaviate 서버 1.27 이상과 HTTP/gRPC 포트가 모두 필요하다. API key 인증 서버는 `WEAVIATE_API_KEY`를 설정한다.
+  - `CppEngineVectorStore`: 사내 C++20 cosine `IndexFlat` 공유 라이브러리를 `ctypes`로 사용하며 문서 메타데이터와 벡터를 프로세스 메모리에 보관한다. 최대 벡터 수 기본값은 25,000개이고, 프로세스 재시작 시 색인이 사라진다. 공유 라이브러리를 빌드해야 한다.
+- **검색·출력 보강**: `kiwipiepy` 형태소 토큰과 `rank-bm25`를 한국어 sparse 후보 재정렬에 사용한다. Qdrant는 `search_terms` keyword payload로 dense 검색 밖의 일치 후보도 회수하고 sparse 조회량은 질의당 최대 2,000개로 제한한다. 이 payload는 신규 인제스트 문서부터 채워지므로, 기존 Qdrant 문서는 재인제스트 전까지 형태소 sparse 회수 대상에 포함되지 않는다. `/query/stream`은 완성 문장/길이 창을 출력 가드레일로 검사하고 PII가 감지된 창은 마스킹한 뒤 전송하며, 오류·조기 종료 때도 final `guardrail` SSE 이벤트를 보낸다. `/extract/structured`는 vLLM `response_format` JSON Schema 제약을 요청하고 결과를 Pydantic으로 다시 검증한다. Parent-child 청킹, HyDE, 질의 라우터는 `.env` 플래그로 선택하며 기본 비활성이다.
+- **설정 변경**: `.env`의 `VECTOR_STORE_TYPE=pgvector|qdrant|weaviate|cpp_engine`. Qdrant/Weaviate는 서버를 실행하고 URL을 설정한다. C++ 단독 모드는 `CPP_VECTOR_ENGINE_LIBRARY`에 공유 라이브러리 경로를 지정한다. `cpp-vector-engine` 저장소에서 `cmake -S . -B build -DBUILD_TESTS=OFF -DBUILD_BENCHMARKS=OFF && cmake --build build --target cve_shared`로 빌드할 수 있다. C++ 모드는 앱 문서·청크·감사 trace를 로컬 메모리/JSONL에 저장해 PostgreSQL 없이 기본 수집·검색·삭제·앱 챗봇 API를 제공한다. JSONL은 검색 문서 저장소가 아니며 재시작 뒤 색인은 복구되지 않는다. 데이터 보존이 필요하면 pgvector/Qdrant/Weaviate를 사용한다. 요청별 엔진 변경은 지원하지 않으며 색인에 사용한 설정과 질의 엔진을 일치시킨다. 엔진을 바꾸면 기존 문서를 다시 인제스트한다.
 - **API**: `GET /vector-stores/status`

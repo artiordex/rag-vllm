@@ -26,6 +26,8 @@ class TextChunk:
     text: str
     start: int
     end: int
+    parent_index: int | None = None
+    parent_text: str | None = None
 
 
 def normalize_text(text: str) -> str:
@@ -165,3 +167,33 @@ def chunk_text(
         start = max(end - overlap, start + 1)
 
     return chunks
+
+
+def chunk_text_parent_child(
+    text: str,
+    *,
+    child_size: int = 280,
+    child_overlap: int = 40,
+    parent_size: int = 1200,
+    parent_overlap: int = 120,
+) -> list[TextChunk]:
+    """작은 자식 청크 검색과 큰 부모 문맥 주입을 위한 계층형 청킹을 수행함"""
+    if parent_size < child_size:
+        raise ValueError("parent_size must be >= child_size")
+    parents = chunk_text(text, parent_size, parent_overlap)
+    children: list[TextChunk] = []
+    next_index = 0
+    for parent in parents:
+        for child in chunk_text(parent.text, child_size, child_overlap):
+            children.append(
+                TextChunk(
+                    index=next_index,
+                    text=child.text,
+                    start=parent.start + child.start,
+                    end=min(parent.end, parent.start + child.end),
+                    parent_index=parent.index,
+                    parent_text=parent.text,
+                )
+            )
+            next_index += 1
+    return children

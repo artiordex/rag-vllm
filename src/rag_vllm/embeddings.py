@@ -15,7 +15,6 @@ import hashlib
 import math
 import re
 import threading
-from functools import lru_cache
 from typing import Any
 
 from .config import Settings
@@ -34,9 +33,11 @@ def _normalize(vector: list[float]) -> list[float]:
 
 
 _MAX_QUERY_CACHE_SIZE = 512
-_QUERY_CACHE: dict[str, list[float]] = {}
+_QUERY_CACHE: dict[tuple[str, str, int, str, str], list[float]] = {}
 _CACHE_STATS: dict[str, int] = {"hits": 0, "misses": 0}
 _CACHE_LOCK = threading.Lock()
+_EMBEDDERS: dict[Settings, "Embedder"] = {}
+_EMBEDDER_LOCK = threading.Lock()
 
 
 def get_query_embedding_cache_stats() -> dict[str, int]:
@@ -66,6 +67,7 @@ class Embedder:
         self.settings = settings
         self._model: Any = None
         self._model_lock = threading.Lock()
+        self._inference_lock = threading.BoundedSemaphore(settings.embedding_max_concurrent_calls)
 
     @property
     def dimension(self) -> int:
@@ -104,6 +106,7 @@ class Embedder:
             except ImportError as exc:  # NOTE: 선언된 의존성이 테스트 환경에서 누락된 경우만 해당함
                 raise EmbeddingError("FlagEmbedding이 설치되어 있지 않습니다.") from exc
 
+            self._limit_gpu_memory()
             kwargs: dict[str, Any] = {"use_fp16": self.settings.embedding_use_fp16}
             if self.settings.embedding_device and self.settings.embedding_device != "auto":
                 kwargs["devices"] = [self.settings.embedding_device]
@@ -118,6 +121,37 @@ class Embedder:
                     "모델 경로, Hugging Face 접근, GPU/CPU 설정을 확인하세요."
                 ) from exc
             return self._model
+
+    def _limit_gpu_memory(self) -> None:
+        """PyTorch 캐싱 할당기의 프로세스별 VRAM 사용량 상한을 설정함"""
+        device = self.settings.embedding_device.strip().lower()
+        if device != "auto" and not device.startswith("cuda"):
+            return
+        fraction = self.settings.embedding_gpu_memory_fraction
+        if fraction >= 1.0:
+            return
+        try:
+            import torch
+        except ImportError as exc:
+            raise EmbeddingError("GPU VRAM 제한을 설정하려면 PyTorch가 필요합니다.") from exc
+        if not torch.cuda.is_available():
+            if device.startswith("cuda"):
+                raise EmbeddingError("EMBEDDING_DEVICE가 CUDA를 지정했지만 사용 가능한 GPU가 없습니다.")
+            return
+
+        if device.startswith("cuda:"):
+            try:
+                device_indexes = [int(device.partition(":")[2])]
+            except ValueError as exc:
+                raise EmbeddingError("EMBEDDING_DEVICE는 cuda 또는 cuda:N 형식이어야 합니다.") from exc
+        else:
+            device_indexes = list(range(torch.cuda.device_count()))
+
+        try:
+            for device_index in device_indexes:
+                torch.cuda.set_per_process_memory_fraction(fraction, device=device_index)
+        except Exception as exc:
+            raise EmbeddingError("임베딩 모델의 GPU 메모리 상한을 설정하지 못했습니다.") from exc
 
     @staticmethod
     def _as_lists(value: Any) -> list[list[float]]:
@@ -147,7 +181,8 @@ class Embedder:
         try:
             method_name = "encode_queries" if query else "encode_corpus"
             method = getattr(model, method_name, None) or getattr(model, "encode")
-            result = method(texts, batch_size=self.settings.embedding_batch_size)
+            with self._inference_lock:
+                result = method(texts, batch_size=self.settings.embedding_batch_size)
             vectors = self._as_lists(result)
         except Exception as exc:
             raise EmbeddingError("임베딩 계산에 실패했습니다.") from exc
@@ -178,8 +213,15 @@ class Embedder:
         Raises:
             EmbeddingError: 설정된 임베딩 제공자를 사용할 수 없을 때 발생함
         """
+        cache_key = (
+            self.settings.embedding_provider,
+            self.settings.embedding_model,
+            self.dimension,
+            self.settings.embedding_device,
+            text,
+        )
         with _CACHE_LOCK:
-            cached = _QUERY_CACHE.get(text)
+            cached = _QUERY_CACHE.get(cache_key)
             if cached is not None:
                 _CACHE_STATS["hits"] += 1
                 return cached
@@ -195,11 +237,17 @@ class Embedder:
         with _CACHE_LOCK:
             if len(_QUERY_CACHE) >= _MAX_QUERY_CACHE_SIZE:
                 _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)), None)
-            _QUERY_CACHE[text] = vec
+            _QUERY_CACHE[cache_key] = vec
         return vec
 
 
-@lru_cache(maxsize=4)
 def get_embedder(settings: Settings) -> Embedder:
-    """동일한 불변 설정에 대해 임베더 인스턴스를 재사용함"""
-    return Embedder(settings)
+    """동일한 불변 설정에 대한 모델 초기화를 단일 프로세스 잠금으로 직렬화함"""
+    with _EMBEDDER_LOCK:
+        embedder = _EMBEDDERS.get(settings)
+        if embedder is None:
+            embedder = Embedder(settings)
+            _EMBEDDERS[settings] = embedder
+            if len(_EMBEDDERS) > 4:
+                _EMBEDDERS.pop(next(iter(_EMBEDDERS)))
+        return embedder

@@ -40,10 +40,12 @@ services:
       - "0.0.0.0"
       - "--port"
       - "8000"
-      # NOTE: 실행 중 동적 LoRA 어댑터를 사용하려면 아래 항목의 주석을 해제함
+      # NOTE: 시작 시 등록한 어댑터를 요청별로 선택하려면 아래 항목을 설정함
       # - "--enable-lora"
       # - "--max-loras"
       # - "4"
+      # - "--lora-modules"
+      # - "moe-standard-v1=/root/lora-adapters/moe-standard-v1"
 
 volumes:
   ragvllm-postgres:
