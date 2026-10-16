@@ -29,7 +29,7 @@ from .db import (
     delete_document,
     find_document_by_hash,
     find_document_id_by_source_scope,
-    find_document_sources_by_ids,
+    find_document_source_bindings_by_ids,
     get_audit_logs,
     get_document,
     get_document_content,
@@ -45,7 +45,7 @@ from .embeddings import get_embedder
 from .llm import LLMClient
 from .models import QueryOptions
 from .query_planner import plan_subqueries
-from .retrieval_gate import evaluate_retrieval_relevance
+from .laya_gate import evaluate_crag_gate
 from .semantic_cache import (
     clear_semantic_responses,
     find_semantic_response,
@@ -484,7 +484,7 @@ def _retrieve_candidates(
     """선택된 색인 엔진에서 후보 청크를 조회하고 공통 RAG 형식으로 변환함"""
     if vector_store_type == "pgvector":
         if search_mode == "hybrid":
-            return search_chunks_hybrid(
+            store_hits = search_chunks_hybrid(
                 settings,
                 query_embedding,
                 query_text,
@@ -496,33 +496,34 @@ def _retrieve_candidates(
                 department=department,
                 max_security_level=max_security_level,
             )
-        return search_chunks(
-            settings,
-            query_embedding,
-            top_k=top_k,
-            document_id=document_id,
-            document_ids=document_ids,
-            min_quality_score=min_quality_score,
-            project_name=project_name,
-            department=department,
-            max_security_level=max_security_level,
-        )
-
-    store = get_vector_store(settings, vector_store_type)
-    search = store.search_hybrid if search_mode == "hybrid" else store.search
-    kwargs: dict[str, Any] = {
-        "query_vector": query_embedding,
-        "top_k": top_k,
-        "document_id": document_id,
-        "document_ids": document_ids,
-        "min_quality_score": min_quality_score,
-        "project_name": project_name,
-        "department": department,
-        "max_security_level": max_security_level,
-    }
-    if search_mode == "hybrid":
-        kwargs["query_text"] = query_text
-    store_hits = search(**kwargs)
+        else:
+            store_hits = search_chunks(
+                settings,
+                query_embedding,
+                top_k=top_k,
+                document_id=document_id,
+                document_ids=document_ids,
+                min_quality_score=min_quality_score,
+                project_name=project_name,
+                department=department,
+                max_security_level=max_security_level,
+            )
+    else:
+        store = get_vector_store(settings, vector_store_type)
+        search = store.search_hybrid if search_mode == "hybrid" else store.search
+        kwargs: dict[str, Any] = {
+            "query_vector": query_embedding,
+            "top_k": top_k,
+            "document_id": document_id,
+            "document_ids": document_ids,
+            "min_quality_score": min_quality_score,
+            "project_name": project_name,
+            "department": department,
+            "max_security_level": max_security_level,
+        }
+        if search_mode == "hybrid":
+            kwargs["query_text"] = query_text
+        store_hits = search(**kwargs)
     parsed_hits: list[tuple[UUID, dict[str, Any]]] = []
     for hit in store_hits:
         try:
@@ -532,16 +533,21 @@ def _retrieve_candidates(
         parsed_hits.append((parsed_document_id, hit))
 
     requested_ids = list(dict.fromkeys(document_id for document_id, _ in parsed_hits))
+    document_content_digests: dict[UUID, str] = {}
     if vector_store_type == "cpp_engine":
         active_sources = store.get_document_sources_by_ids(requested_ids, project_name=project_name)
     else:
         # 외부 저장소의 orphan 벡터는 PostgreSQL의 현재 문서 ID와 프로젝트 범위를
         # 대조해 제거함. C++ 모드는 메타데이터도 같은 로컬 저장소가 소유함.
-        active_sources = find_document_sources_by_ids(
+        active_bindings = find_document_source_bindings_by_ids(
             settings,
             requested_ids,
             project_name=project_name,
         )
+        active_sources = {document_id: binding[0] for document_id, binding in active_bindings.items()}
+        document_content_digests = {
+            document_id: binding[1] for document_id, binding in active_bindings.items()
+        }
     results: list[dict[str, Any]] = []
     for parsed_document_id, hit in parsed_hits:
         source_name = active_sources.get(parsed_document_id)
@@ -551,14 +557,25 @@ def _retrieve_candidates(
         metadata = dict(hit_metadata) if isinstance(hit_metadata, dict) else {}
         if project_name is not None:
             metadata["project_name"] = project_name
+        content_digest = document_content_digests.get(parsed_document_id)
+        if content_digest is not None:
+            metadata["document_content_sha256"] = content_digest
+        hit_text = hit.get("content")
+        if not isinstance(hit_text, str):
+            hit_text = hit.get("text")
+        hit_score = hit.get("combined_score")
+        if hit_score is None:
+            hit_score = hit.get("rrf_score")
+        if hit_score is None:
+            hit_score = hit.get("score", 0.0)
         results.append({
             "document_id": parsed_document_id,
             "source_name": source_name,
             "source_type": hit.get("source_type") or "unknown",
             "chunk_index": hit.get("chunk_index", 0),
-            "text": hit.get("content", "") or "",
-            "content": hit.get("content", "") or "",
-            "score": hit.get("combined_score", 0.0),
+            "text": hit_text or "",
+            "content": hit_text or "",
+            "score": hit_score,
             "metadata": metadata,
             "quality_score": hit.get("quality_score", 100),
         })
@@ -900,12 +917,16 @@ def query_rag(
             "multi_query_enabled": settings.multi_query_enabled,
             "contextual_retrieval_enabled": settings.contextual_retrieval_enabled,
             "crag_enabled": settings.crag_enabled,
+            "laya_gate_mode": settings.laya_gate_mode,
+            "laya_gate_min_support_probability": settings.laya_gate_min_support_probability,
+            "laya_base_url": settings.laya_base_url,
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    if use_llm and semantic_cache_enabled:
+    shadow_laya_active = settings.crag_enabled and settings.laya_gate_mode == "shadow"
+    if use_llm and semantic_cache_enabled and not shadow_laya_active:
         cached_result = _find_semantic_cache(settings, query_embedding, filter_key)
         if cached_result is not None:
             return cached_result
@@ -980,29 +1001,22 @@ def query_rag(
     retrieval_gate: dict[str, Any] | None = None
     crag_blocked = False
     if settings.crag_enabled:
-        query_decisions = [
-            {
-                "query": planned_query,
-                "decision": evaluate_retrieval_relevance(planned_query, query_hits),
-            }
-            for planned_query, query_hits in zip(retrieved_queries, ranked_candidates, strict=False)
-        ]
-        all_accepted = bool(query_decisions) and all(
-            item["decision"].action == "accept" for item in query_decisions
+        gate_span = trace.start_span("retrieval_gate", {"laya_mode": settings.laya_gate_mode})
+        retrieval_gate, crag_accepted = evaluate_crag_gate(
+            settings,
+            question=question,
+            planned_queries=retrieved_queries,
+            candidate_lists=ranked_candidates,
+            reranked_hits=hits,
         )
-        first_rejected = next((item["decision"] for item in query_decisions if item["decision"].action != "accept"), None)
-        retrieval_gate = {
-            "action": "accept" if all_accepted else "abstain",
-            "suggested_action": None if all_accepted or first_rejected is None else first_rejected.action,
-            "reason": "all_subqueries_supported" if all_accepted else (first_rejected.reason if first_rejected else "no_query_decisions"),
-            "evidence": {
-                "subqueries": [
-                    {"query": item["query"], **item["decision"].evidence}
-                    for item in query_decisions
-                ],
-            },
-        }
-        if not all_accepted:
+        gate_span.finish(
+            {
+                "action": retrieval_gate["action"],
+                "lexical_action": retrieval_gate.get("lexical_action", retrieval_gate["action"]),
+                "laya_status": (retrieval_gate.get("laya") or {}).get("status"),
+            }
+        )
+        if not crag_accepted:
             # 현재 안전한 재작성 후보가 없는 경우 생성하지 않고 근거 부족으로 보류함.
             crag_blocked = True
             hits = []
@@ -1125,6 +1139,7 @@ def query_rag(
         use_llm
         and answer
         and semantic_cache_enabled
+        and not shadow_laya_active
         and not crag_blocked
         and hallucination_risk != "high"
         and trace.guardrail_action != GuardrailAction.BLOCK.value
@@ -1529,27 +1544,14 @@ def stream_query_rag(
     stream_gate: dict[str, Any] | None = None
     crag_blocked = False
     if settings.crag_enabled:
-        decisions = [
-            {
-                "query": planned_query,
-                "decision": evaluate_retrieval_relevance(planned_query, query_hits),
-            }
-            for planned_query, query_hits in zip(retrieved_queries, candidate_lists, strict=False)
-        ]
-        all_accepted = bool(decisions) and all(item["decision"].action == "accept" for item in decisions)
-        first_rejected = next((item["decision"] for item in decisions if item["decision"].action != "accept"), None)
-        stream_gate = {
-            "action": "accept" if all_accepted else "abstain",
-            "suggested_action": None if all_accepted or first_rejected is None else first_rejected.action,
-            "reason": "all_subqueries_supported" if all_accepted else (first_rejected.reason if first_rejected else "no_query_decisions"),
-            "evidence": {
-                "subqueries": [
-                    {"query": item["query"], **item["decision"].evidence}
-                    for item in decisions
-                ],
-            },
-        }
-        if not all_accepted:
+        stream_gate, crag_accepted = evaluate_crag_gate(
+            settings,
+            question=question,
+            planned_queries=retrieved_queries,
+            candidate_lists=candidate_lists,
+            reranked_hits=hits,
+        )
+        if not crag_accepted:
             crag_blocked = True
             hits = []
 

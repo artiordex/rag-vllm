@@ -31,6 +31,19 @@ API 업로드 기본 한도는 20 MiB다. PDF는 최대 2,000페이지, DOCX/HWP
 
 `CRAG_ENABLED=true`는 검색 후 질문과 상위 청크의 형태소 근거를 검사한다. 현재 저장소별 점수는 보정된 확률이 아니므로 이 값을 임계치로 간주하지 않는다. 어휘 근거가 부족하면 생성 단계를 건너뛰고 근거 부족을 반환한다. 이는 정답성 증명기가 아니며, 배포 전에 도메인 질의로 거절률과 누락률을 확인한다.
 
+Laya를 보조 의미 판정기로 쓰려면 `CRAG_ENABLED=true`, `LAYA_BASE_URL=http://127.0.0.1:11030`, `LAYA_GATE_MODE=shadow`를 설정한다. `shadow`는 질문, 계획된 하위 질의와 리랭킹된 상위 근거를 Laya에 보내 판정 결과·지연시간을 기록하지만 현재 어휘 CRAG의 통과/보류 동작은 바꾸지 않는다. shadow 평가 중에는 매번 새 판정을 얻도록 생성 답변 시맨틱 캐시를 우회하므로 질의 지연이 늘 수 있다. Laya 서비스 장애, 잘린 입력 또는 잘못된 응답은 기존 CRAG 판정으로 폴백한다. Laya에 보낼 질문이 1,500자를 넘거나 근거가 없으면 호출을 건너뛴다. `LAYA_GATE_MODE=enforce`는 어휘 게이트가 보류한 질의만 Laya가 추가 판정하고, `LAYA_GATE_MIN_SUPPORT_PROBABILITY` 이상일 때 답변 생성을 허용한다. 어휘 게이트가 이미 통과시킨 질의는 enforce 모드에서 Laya가 다시 호출되지 않는다. 기본 임계값 0.9는 시작값일 뿐이며, 운영 전에 한국어 도메인 골든셋으로 정밀도·누락률·지연시간을 확인해 조정한다.
+
+Laya는 별도 `laya-serve` HTTP 프로세스로 실행한다. 공식 Laya 저장소를 체크아웃한 뒤 그 저장소에서 아래처럼 실행하고, rag-vllm의 `.env`에 URL과 모드를 설정한다. vLLM과 GPU 메모리를 공유하지 않도록 우선 CPU 실행을 권장한다. CPU 판정 지연은 실제 장비에서 측정한다. 질문과 검색 근거 일부가 설정한 Laya 서버로 전달되므로 내부의 신뢰된 주소를 사용하고, 인증이 켜진 경우에만 `LAYA_API_KEY`를 설정한다.
+
+```bash
+# Laya 저장소에서 실행. 포트는 rag-vllm의 기본 vLLM/API 포트와 분리한다.
+LAYA_PORT=11030 LAYA_BIND_ADDRESS=127.0.0.1 LAYA_DEVICE=cpu \
+LAYA_PRELOAD=1 LAYA_MODELS=english,multilingual LAYA_JEV_STRICT=0 \
+  docker compose -f compose.yaml -f compose.http.yaml up --build -d laya-serve
+```
+
+Shadow 결과는 `/query`의 `retrieval_gate.laya` 또는 `/query/stream`의 `retrieval_gate` SSE 이벤트에서 확인할 수 있다. 잘림 여부를 검증할 수 있도록 Laya 응답의 `usage.truncated` 필드가 포함된 기본 응답 형식을 유지한다 (`LAYA_JEV_STRICT=1`은 이 필드를 숨긴다). 앱 전용 `/chat/query` 응답에는 내부 판정 상세를 포함하지 않는다. Laya는 검색 근거의 정답성이나 문서 접근 권한을 증명하지 않으며, 입력 보안 가드레일을 대체하지 않는다. 공식 [Laya HTTP API](https://nandhakishorm.github.io/laya/http-api/)와 [벤치마크 한계](https://nandhakishorm.github.io/laya/benchmarks/)를 참고한다.
+
 ### 분산 시맨틱 캐시
 
 기본 캐시는 프로세스 메모리에서 동작한다. 워커 간 공유와 재시작 후 보존이 필요하면 `uv sync --extra redis-cache`로 Redis 클라이언트를 설치하고 `SEMANTIC_CACHE_REDIS_URL=rediss://...`를 설정한다. Redis 캐시는 보안·프로젝트·문서 범위 및 모델 설정을 포함한 별도 키, TTL, 범위별 항목 제한을 사용한다. 인제스트/삭제 시 캐시 세대를 변경해 이전 답변을 무효화한다. Redis 장애나 클라이언트 미설치는 질의 실패 대신 로컬 메모리 캐시로 폴백한다. Redis에는 생성 답변과 인용 문맥 일부가 저장되므로 내부 접근 제한, TLS, 서버 maxmemory/eviction 정책을 설정한다. `/chat/query`의 앱 전용 질의는 캐시를 사용하지 않는다.
@@ -84,12 +97,12 @@ RAG-vLLM은 앱 서버가 호출하는 API로 운영한다. `.env.example`은 �
 
 ```bash
 python -c 'import secrets; print(secrets.token_urlsafe(48))'
-RAG_CHAT_CLIENTS_JSON='{"internal-nas":{"token":"replace-with-a-generated-nas-token-at-least-32-characters","project_name":"internal-nas","permissions":["query","ingest","delete"]},"internal-portal":{"token":"replace-with-a-generated-portal-token-at-least-32-characters","project_name":"internal-portal","permissions":["query"]},"food-safety":{"token":"replace-with-a-generated-food-token-at-least-32-characters","project_name":"food-safety","permissions":["query","ingest"]},"moe-dq-diag":{"token":"replace-with-a-generated-moe-token-at-least-32-characters","project_name":"moe_dq_diag","permissions":["query"]}}'
+RAG_CHAT_CLIENTS_JSON='{"internal-nas":{"token":"replace-with-a-generated-nas-token-at-least-32-characters","project_name":"internal-nas","permissions":["query","ingest","delete"]},"internal-portal":{"token":"replace-with-a-generated-portal-token-at-least-32-characters","project_name":"internal-portal","permissions":["query"]},"food-safety":{"token":"replace-with-a-generated-food-token-at-least-32-characters","project_name":"food-safety","permissions":["query","ingest"]},"moe-dq-diag":{"token":"replace-with-a-generated-moe-query-token-at-least-32-characters","project_name":"moe_dq_diag","permissions":["query"]},"moe-dq-standards-ingest":{"token":"replace-with-a-generated-moe-ingest-token-at-least-32-characters","project_name":"moe_dq_diag","permissions":["ingest"]}}'
 ```
 
 설명용 자리표시자는 서비스에 적용하기 전에 각각 별도로 생성한 무작위 토큰으로 바꾼다.
 
-각 앱의 서버는 `POST http://<rag-vllm 주소>:11020/chat/query`에 JSON `{"question":"...","top_k":5}`와 `X-RAG-Client-ID`, `X-API-Key` 헤더를 보낸다. 응답은 일반 검색/RAG의 `answer`, `sources`, `confidence_score`, `hallucination_risk`, 가드레일 필드를 포함한다. LMOps 일반 설정이 바뀌어도 이 경로는 질문·답변 원문을 저장하지 않으며 시맨틱 캐시도 사용하지 않는다. 앱 질의는 길이만 남기는 요약 감사 로그를 사용한다. 권한은 앱마다 최소화한다. NAS에는 query/ingest/delete, food-safety에는 query/ingest, internal-portal과 moe-dq-diag에는 query만 부여한다. `project_name`과 허용 작업은 클라이언트가 바꿀 수 없다.
+각 앱의 서버는 `POST http://<rag-vllm 주소>:11020/chat/query`에 JSON `{"question":"...","top_k":5}`와 `X-RAG-Client-ID`, `X-API-Key` 헤더를 보낸다. 응답은 일반 검색/RAG의 `answer`, `sources`, `confidence_score`, `hallucination_risk`, 가드레일 필드를 포함한다. LMOps 일반 설정이 바뀌어도 이 경로는 질문·답변 원문을 저장하지 않으며 시맨틱 캐시도 사용하지 않는다. 앱 질의는 길이만 남기는 요약 감사 로그를 사용한다. 권한은 앱마다 최소화한다. NAS에는 query/ingest/delete, food-safety에는 query/ingest, internal-portal과 moe-dq-diag에는 query, 공통표준 corpus 업로더에는 ingest만 부여한다. 같은 `project_name`에 서로 다른 앱 ID와 권한을 둘 수 있으며 각 토큰은 고유해야 한다. `project_name`과 허용 작업은 클라이언트가 바꿀 수 없다.
 
 이 앱별 범위는 코퍼스 분리이며 사용자별 파일 권한 검사가 아니다. 해당 프로젝트 이름으로 승인된 공용 자료만 색인해야 한다. 예를 들어 NAS의 사용자 폴더 파일은 파일 ACL을 질의에 연결하기 전까지 색인하지 않고, 승인된 마스킹 파생본만 공용 지식 범위에 넣는다. `moe_dq_diag`는 규칙 설명과 검토 절차 같은 승인 문서를 별도 검색할 수 있지만, RAG 결과는 진단 점수·비교 적격성·공식 판정을 바꾸지 않는 보조 근거로만 표시한다. 브라우저에서 rag-vllm을 직접 호출하거나 앱 키를 브라우저에 제공하지 않는다. TLS 또는 내부 VPN으로 전송 경로를 보호한다.
 
@@ -202,6 +215,34 @@ curl -X POST http://localhost:11020/quality/enterprise \
 검색 감사 로그는 질의 원문 대신 `omitted;chars:<length>`만 저장한다. 이는 비식별 처리가 아니라 원문을 저장하지 않는 정책이다. 이전 버전에서 만들어진 원문 질의 로그는 DB에서 자동 삭제하지 않으며, API 조회에서는 `legacy_query_redacted`로 가려서 반환한다.
 
 ## `moe_dq_diag`와의 경계
+
+### MOE durable 검토 패널의 RAG·Laya·vLLM 연결
+
+2026-10-12 DEV에서는 별도의 durable 검토 경로인
+`POST /api/v1/ai/durable-diagnosis-review`를 연결했다. MOE 화면은 run별
+허용 목록 projection만 서버로 보내며 원본 파일·추출 본문을 브라우저에서
+rag-vllm으로 직접 보내지 않는다. MOE API가 `moe_dq_diag` project 범위의
+품질 지침을 검색하고, 표준화 조회는 컬럼명·선언 타입을 이용해 공식
+공통표준 corpus를 참조한다. Laya 분류와 vLLM 요약은 검토 보조다. 검색
+결과의 버전 결속은 adapter에서 제공되지 않을 수 있고, 어떤 결과도 MOE의
+deterministic `HOLD`를 해제하거나 승인·적용하지 않는다. 이 연결의 합성
+PoC 증거와 제한은 [`moe_dq_diag` PoC README](../moe_dq_diag/infra/poc/README.md)
+및 해당 인수 체크리스트를 따른다.
+
+MOE API와 vLLM 사이에는 선택적 내부망 overlay를 제공한다. 먼저 MOE
+Compose가 external network `moe_dq_diag_ai-net`을 만들도록 API를 시작한 뒤,
+rag-vllm 디렉터리에서 다음 overlay를 적용한다.
+
+```bash
+(cd ../moe_dq_diag && docker compose \
+  -f infra/docker/compose/compose.rag-vllm.yaml up -d moe-dq-api)
+docker compose --profile vllm -f compose.yaml -f compose.moe-ai.yaml up -d vllm
+```
+
+[`compose.moe-ai.yaml`](./compose.moe-ai.yaml)은 vLLM만 기존 `default` network와
+MOE 내부 AI network에 연결하고 `rag-vllm-vllm-1` DNS alias를 둔다. MOE API는
+RAG PostgreSQL network에 참여하지 않는다. 이 파일은 vLLM container를
+재생성할 때도 해당 network 연결을 유지하기 위한 선택 overlay다.
 
 `moe_dq_diag`의 개발 API는 문서 1건 임시 파싱을 위해 `POST /api/v1/quality/documents/diagnose`를 제공한다. 이 API는 개발 환경에서만 동작하고, 업로드 한도는 25 MiB이며, 파일을 임시 처리 후 삭제하고 원문이 섞일 수 있는 issue sample은 응답에서 제거한다. 응답의 `unstructured-quality-v1`은 추출 가능성만 측정하고 `release_eligible=false`를 유지한다. CER/WER, OCR 정확도, 구조 보존율, 개인정보 마스킹, 저작권, 운영 적합성을 입증하지 않는다.
 

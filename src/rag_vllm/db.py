@@ -63,7 +63,10 @@ class _PooledConnectionProxy:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
-        return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        try:
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
 
 
 def get_db_pool(settings: Settings) -> Any:
@@ -185,7 +188,9 @@ def init_db(settings: Settings) -> None:
     try:
         connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
         connection.commit()
-        register_vector(connection)
+        # psycopg's pgvector adapter requires the underlying Connection object;
+        # the pool proxy only forwards ordinary connection methods.
+        register_vector(connection._conn if isinstance(connection, _PooledConnectionProxy) else connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS rag_documents (
@@ -526,6 +531,36 @@ def find_document_sources_by_ids(
         return {row["id"]: row["source_name"] for row in rows}
     except Exception as exc:
         raise DatabaseError("벡터 검색 결과의 문서 범위를 확인하지 못했습니다.") from exc
+    finally:
+        connection.close()
+
+
+def find_document_source_bindings_by_ids(
+    settings: Settings,
+    document_ids: list[UUID],
+    *,
+    project_name: str | None = None,
+) -> dict[UUID, tuple[str, str]]:
+    """검색된 문서의 현재 출처 이름과 색인 본문 SHA-256을 반환함"""
+    if not document_ids:
+        return {}
+
+    connection = _connect(settings)
+    try:
+        query = "SELECT id, source_name, content_hash FROM rag_documents WHERE id = ANY(%s::uuid[])"
+        params: list[Any] = [document_ids]
+        if project_name is not None:
+            query += " AND metadata->>'project_name' = %s"
+            params.append(project_name)
+        rows = connection.execute(query, params).fetchall()
+        return {
+            row["id"]: (row["source_name"], row["content_hash"])
+            for row in rows
+            if isinstance(row.get("source_name"), str)
+            and isinstance(row.get("content_hash"), str)
+        }
+    except Exception as exc:
+        raise DatabaseError("검색 결과의 문서 버전 결속을 확인하지 못했습니다.") from exc
     finally:
         connection.close()
 

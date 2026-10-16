@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -92,7 +93,6 @@ def _chat_clients_env() -> tuple[ChatClientCredential, ...]:
 
     clients: list[ChatClientCredential] = []
     seen_hashes: set[str] = set()
-    seen_projects: set[str] = set()
     for client_id, value in parsed.items():
         if not isinstance(client_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,63}", client_id):
             raise ValueError("RAG_CHAT_CLIENTS_JSON client IDs must use lowercase letters, digits, '_' or '-'")
@@ -121,9 +121,6 @@ def _chat_clients_env() -> tuple[ChatClientCredential, ...]:
             or project_name == "*"
         ):
             raise ValueError("RAG chat client project_name must be a fixed non-empty project name")
-        if project_name in seen_projects:
-            raise ValueError("RAG chat client project_name scopes must be unique")
-
         raw_permissions = value.get("permissions", ["query"])
         if (
             not isinstance(raw_permissions, list)
@@ -131,15 +128,13 @@ def _chat_clients_env() -> tuple[ChatClientCredential, ...]:
             or any(not isinstance(permission, str) for permission in raw_permissions)
             or len(set(raw_permissions)) != len(raw_permissions)
             or not set(raw_permissions).issubset({"query", "ingest", "delete"})
-            or "query" not in raw_permissions
         ):
-            raise ValueError("RAG chat permissions must be a unique list containing query and optional ingest/delete")
+            raise ValueError("RAG chat permissions must be a non-empty unique list of query, ingest, or delete")
 
         token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
         if token_sha256 in seen_hashes:
             raise ValueError("RAG chat client tokens must be unique")
         seen_hashes.add(token_sha256)
-        seen_projects.add(project_name)
         clients.append(ChatClientCredential(client_id, project_name, frozenset(raw_permissions), token_sha256))
     return tuple(clients)
 
@@ -230,6 +225,11 @@ class Settings:
     contextual_retrieval_enabled: bool = False
     multi_query_enabled: bool = False
     crag_enabled: bool = False
+    laya_base_url: str | None = None
+    laya_api_key: str | None = field(default=None, repr=False)
+    laya_gate_mode: str = "off"
+    laya_gate_min_support_probability: float = 0.9
+    laya_timeout_seconds: float = 5.0
     semantic_cache_redis_url: str | None = field(default=None, repr=False)
     semantic_cache_ttl_seconds: int = 1800
     semantic_cache_max_entries: int = 256
@@ -269,6 +269,38 @@ class Settings:
             raise ValueError("MAX_UPLOAD_BYTES must be positive")
         if self.moe_dq_api_timeout_seconds <= 0:
             raise ValueError("MOE_DQ_API_TIMEOUT_SECONDS must be positive")
+        if self.laya_gate_mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("LAYA_GATE_MODE must be 'off', 'shadow', or 'enforce'")
+        if (
+            not math.isfinite(self.laya_gate_min_support_probability)
+            or not 0 < self.laya_gate_min_support_probability <= 1
+        ):
+            raise ValueError("LAYA_GATE_MIN_SUPPORT_PROBABILITY must be in (0, 1]")
+        if not math.isfinite(self.laya_timeout_seconds) or self.laya_timeout_seconds <= 0:
+            raise ValueError("LAYA_TIMEOUT_SECONDS must be positive")
+        if self.laya_base_url:
+            laya = urlsplit(self.laya_base_url)
+            if (
+                laya.scheme not in {"http", "https"}
+                or not laya.hostname
+                or laya.username is not None
+                or laya.password is not None
+                or laya.query
+                or laya.fragment
+            ):
+                raise ValueError("LAYA_BASE_URL must be an http(s) base URL without credentials, query, or fragment")
+            try:
+                laya_port = laya.port
+            except ValueError as exc:
+                raise ValueError("LAYA_BASE_URL must contain a valid TCP port") from exc
+            if laya_port is not None and not 1 <= laya_port <= 65535:
+                raise ValueError("LAYA_BASE_URL port must be between 1 and 65535")
+        elif self.laya_gate_mode != "off":
+            raise ValueError("LAYA_BASE_URL is required when LAYA_GATE_MODE is 'shadow' or 'enforce'")
+        if self.laya_api_key and (len(self.laya_api_key) > 4096 or any(char.isspace() for char in self.laya_api_key)):
+            raise ValueError("LAYA_API_KEY must be at most 4096 non-whitespace characters")
+        if self.laya_api_key and not self.laya_base_url:
+            raise ValueError("LAYA_BASE_URL is required when LAYA_API_KEY is set")
         if self.moe_dq_api_base_url:
             parsed = urlsplit(self.moe_dq_api_base_url)
             if (
@@ -394,6 +426,11 @@ class Settings:
             contextual_retrieval_enabled=_bool_env("CONTEXTUAL_RETRIEVAL_ENABLED", False),
             multi_query_enabled=_bool_env("MULTI_QUERY_ENABLED", False),
             crag_enabled=_bool_env("CRAG_ENABLED", False),
+            laya_base_url=(os.getenv("LAYA_BASE_URL") or "").strip().rstrip("/") or None,
+            laya_api_key=os.getenv("LAYA_API_KEY") or None,
+            laya_gate_mode=os.getenv("LAYA_GATE_MODE", "off").strip().lower(),
+            laya_gate_min_support_probability=_float_env("LAYA_GATE_MIN_SUPPORT_PROBABILITY", 0.9),
+            laya_timeout_seconds=_float_env("LAYA_TIMEOUT_SECONDS", 5.0),
             semantic_cache_redis_url=(os.getenv("SEMANTIC_CACHE_REDIS_URL") or "").strip() or None,
             semantic_cache_ttl_seconds=_int_env("SEMANTIC_CACHE_TTL_SECONDS", 1800),
             semantic_cache_max_entries=_int_env("SEMANTIC_CACHE_MAX_ENTRIES", 256),

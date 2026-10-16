@@ -225,11 +225,17 @@ class ChatHealthResponse(BaseModel):
 
 
 class ChatSourceMetadata(BaseModel):
-    """앱용 인용에는 서버가 고정한 코퍼스 이름만 포함함"""
+    """앱용 인용에 서버가 고정한 코퍼스 범위와 문서 본문 digest를 포함함"""
 
     model_config = {"extra": "forbid"}
 
     project_name: str = Field(min_length=1, max_length=128)
+    document_content_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class ChatSourceHit(BaseModel):

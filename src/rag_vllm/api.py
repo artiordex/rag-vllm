@@ -18,6 +18,7 @@ import logging
 import math
 import mimetypes
 import os
+import re
 import time
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
@@ -308,22 +309,32 @@ def _mask_app_chat_response(result: dict[str, Any], project_name: str) -> dict[s
                     status_code=502,
                     detail="RAG 검색 근거의 점수를 확인할 수 없습니다.",
                 )
+            source_content_digest = source_metadata.get("document_content_sha256")
+            if source_content_digest is not None and (
+                not isinstance(source_content_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_content_digest) is None
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail="RAG 검색 근거의 문서 digest를 확인할 수 없습니다.",
+                )
             safe_name, name_findings = detect_and_mask_pii(source_name, mask=True)
             safe_text, text_findings = detect_and_mask_pii(text, mask=True)
             masked_any = masked_any or bool(name_findings) or bool(text_findings)
-            safe_sources.append(
-                {
-                    "rank": raw_source.get("rank"),
-                    "document_id": raw_source.get("document_id"),
-                    "source_name": safe_name[:256],
-                    "chunk_index": raw_source.get("chunk_index"),
-                    # Third-party reranker logits are not probabilities. Expose
-                    # a stable bounded transport score while preserving rank.
-                    "score": min(1.0, max(0.0, score)),
-                    "text": safe_text[:1_200],
-                    "metadata": {"project_name": project_name},
-                }
-            )
+            safe_metadata: dict[str, str | None] = {"project_name": project_name}
+            if source_content_digest is not None:
+                safe_metadata["document_content_sha256"] = source_content_digest
+            safe_sources.append({
+                "rank": raw_source.get("rank"),
+                "document_id": raw_source.get("document_id"),
+                "source_name": safe_name[:256],
+                "chunk_index": raw_source.get("chunk_index"),
+                # Third-party reranker logits are not probabilities. Expose
+                # a stable bounded transport score while preserving rank.
+                "score": min(1.0, max(0.0, score)),
+                "text": safe_text[:1_200],
+                "metadata": safe_metadata,
+            })
         result["sources"] = safe_sources
 
     if masked_any and result.get("guardrail_action") in {None, "allow", "mask"}:

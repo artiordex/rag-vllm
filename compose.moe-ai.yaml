@@ -1,0 +1,15 @@
+# Private model access for the MOE quality API. This joins only vLLM to the
+# app's internal AI network; the MOE API never joins the RAG database network.
+services:
+  vllm:
+    networks:
+      default: {}
+      moe-ai:
+        aliases:
+          - rag-vllm-vllm-1
+
+networks:
+  default: {}
+  moe-ai:
+    name: ${MOE_AI_NETWORK_NAME:-moe_dq_diag_ai-net}
+    external: true
