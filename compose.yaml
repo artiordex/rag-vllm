@@ -1,6 +1,7 @@
 # NOTE: PostgreSQL·vLLM 개발 서비스와 로컬 포트 매핑을 정의함
 services:
   postgres:
+    container_name: rag-vllm-postgres
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
@@ -13,6 +14,7 @@ services:
       - ragvllm-postgres:/var/lib/postgresql/data
 
   vllm:
+    container_name: rag-vllm-vllm
     profiles: ["vllm"]
     image: "${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}"
     restart: unless-stopped
