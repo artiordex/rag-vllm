@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -186,9 +187,19 @@ async def lifespan(_app: FastAPI):
             init_db(settings)
         except DatabaseError as exc:
             logger.warning("DB 자동 초기화를 건너뜁니다: %s", exc)
+    warmup_task = None
+    if os.getenv("FOOD_SAFETY_CHAT_MODEL_WARMUP", "true").strip().lower() not in {"0", "false", "no", "off"}:
+        warmup_task = asyncio.create_task(_warm_food_safety_model(), name="food-safety-model-warmup")
     try:
         yield
     finally:
+        if warmup_task is not None:
+            if not warmup_task.done():
+                warmup_task.cancel()
+            try:
+                await warmup_task
+            except asyncio.CancelledError:
+                pass
         if settings.vector_store_type == "cpp_engine":
             try:
                 get_vector_store(settings, "cpp_engine").close()
@@ -497,19 +508,8 @@ def _food_safety_model_chat(question: str) -> ChatQueryResponse:
     if not input_guardrail.passed:
         raise HTTPException(status_code=422, detail="질문을 안전하게 처리할 수 없습니다.")
 
-    base_url = str(os.getenv("FOOD_SAFETY_CHAT_MODEL_BASE_URL", "http://127.0.0.1:11434/v1")).strip().rstrip("/")
-    model = str(os.getenv("FOOD_SAFETY_CHAT_MODEL", "gpt-oss:20b")).strip()
     try:
-        parsed_url = urlsplit(base_url)
-        if (
-            parsed_url.scheme != "http"
-            or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
-            or parsed_url.port not in {None, 11434}
-            or parsed_url.path not in {"", "/v1"}
-            or parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment
-            or not model or len(model) > 128
-        ):
-            raise ValueError("model endpoint must be the local Ollama API")
+        model_api_url, model = _food_safety_model_config()
     except ValueError as exc:
         logger.error("식품안전 모델 endpoint 설정이 유효하지 않습니다.")
         raise HTTPException(status_code=503, detail="식품안전 모델 설정을 확인할 수 없습니다.") from exc
@@ -531,22 +531,24 @@ def _food_safety_model_chat(question: str) -> ChatQueryResponse:
     try:
         with httpx.Client(timeout=timeout_seconds, trust_env=False) as client:
             response = client.post(
-                f"{base_url}/chat/completions",
+                f"{model_api_url}/api/chat",
                 json={
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": input_guardrail.sanitized_text},
                     ],
-                    "temperature": 0.2,
-                    "reasoning_effort": "low",
-                    "max_tokens": 350,
+                    "think": "low",
+                    "options": {"temperature": 0.2, "num_predict": 350},
+                    # Keep the model resident only for this food-safety model path;
+                    # do not change Ollama's shared global keep-alive setting.
+                    "keep_alive": -1,
                     "stream": False,
                 },
             )
             response.raise_for_status()
             data = response.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+        content = data.get("message", {}).get("content")
         if isinstance(content, list):
             content = "\n".join(
                 str(item.get("text", "")) for item in content
@@ -567,6 +569,39 @@ def _food_safety_model_chat(question: str) -> ChatQueryResponse:
         guardrail_action=output_guardrail.action.value,
         query_route="conversation",
     )
+
+
+def _food_safety_model_config() -> tuple[str, str]:
+    """식품안전 전용 Ollama endpoint만 허용함"""
+    base_url = str(os.getenv("FOOD_SAFETY_CHAT_MODEL_BASE_URL", "http://127.0.0.1:11434/v1")).strip().rstrip("/")
+    model = str(os.getenv("FOOD_SAFETY_CHAT_MODEL", "gpt-oss:20b")).strip()
+    parsed_url = urlsplit(base_url)
+    if (
+        parsed_url.scheme != "http"
+        or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed_url.port not in {None, 11434}
+        or parsed_url.path not in {"", "/v1"}
+        or parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment
+        or not model or len(model) > 128
+    ):
+        raise ValueError("model endpoint must be the local Ollama API")
+    return f"{parsed_url.scheme}://{parsed_url.netloc}", model
+
+
+async def _warm_food_safety_model() -> None:
+    """서버 시작 시 식품안전 전용 모델만 백그라운드에서 메모리에 올림"""
+    try:
+        model_api_url, model = _food_safety_model_config()
+        timeout = httpx.Timeout(connect=5.0, read=600.0, write=5.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            response = await client.post(
+                f"{model_api_url}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": -1, "stream": False},
+            )
+            response.raise_for_status()
+        logger.info("식품안전 전용 모델 예열 완료 (%s)", model)
+    except Exception as exc:
+        logger.warning("식품안전 전용 모델 예열을 건너뜁니다 (%s)", type(exc).__name__)
 
 
 @chat_router.post("/chat/query/structured", response_model=ChatStructuredQueryResponse)
