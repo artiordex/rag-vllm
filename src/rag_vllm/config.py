@@ -127,9 +127,9 @@ def _chat_clients_env() -> tuple[ChatClientCredential, ...]:
             or not raw_permissions
             or any(not isinstance(permission, str) for permission in raw_permissions)
             or len(set(raw_permissions)) != len(raw_permissions)
-            or not set(raw_permissions).issubset({"query", "ingest", "delete"})
+            or not set(raw_permissions).issubset({"query", "ingest", "delete", "generate"})
         ):
-            raise ValueError("RAG chat permissions must be a non-empty unique list of query, ingest, or delete")
+            raise ValueError("RAG chat permissions must be a non-empty unique list of query, ingest, delete, or generate")
 
         token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
         if token_sha256 in seen_hashes:

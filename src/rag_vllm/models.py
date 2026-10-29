@@ -174,13 +174,14 @@ class QueryRequest(BaseModel):
 
 
 class ChatQueryRequest(BaseModel):
-    """앱별 검색 범위를 서버 설정에 맡기고 필요하면 LLM 답변 생성을 생략함"""
+    """앱별 검색 범위의 RAG 검색 또는 권한이 있는 모델 단독 생성을 요청함"""
 
     model_config = {"extra": "forbid"}
 
     question: str = Field(min_length=1, max_length=5_000)
     top_k: int = Field(default=5, ge=1, le=10)
     generate_answer: bool = Field(default=True, strict=True)
+    mode: Literal["rag", "model"] = "rag"
 
 
 class ChatIngestRequest(BaseModel):
