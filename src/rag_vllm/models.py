@@ -182,6 +182,7 @@ class ChatQueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=10)
     generate_answer: bool = Field(default=True, strict=True)
     mode: Literal["rag", "model"] = "rag"
+    context: str | None = Field(default=None, max_length=8_000)
 
 
 class ChatIngestRequest(BaseModel):
