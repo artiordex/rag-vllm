@@ -20,8 +20,25 @@ _KIWI: Any = None
 _KIWI_INITIALIZED = False
 _NOUN_TAGS = {"NNG", "NNP", "NNB", "NR", "NP", "SL", "SN"}
 _STOPWORDS = {
-    "관련", "기준", "내용", "방법", "사항", "자료", "정보", "정도", "경우", "대해", "대한",
-    "그리고", "또는", "어떻게", "무엇", "어디", "언제", "해주세요", "알려주세요",
+    "관련",
+    "기준",
+    "내용",
+    "방법",
+    "사항",
+    "자료",
+    "정보",
+    "정도",
+    "경우",
+    "대해",
+    "대한",
+    "그리고",
+    "또는",
+    "어떻게",
+    "무엇",
+    "어디",
+    "언제",
+    "해주세요",
+    "알려주세요",
 }
 
 
@@ -97,9 +114,14 @@ def bm25_rerank(
     try:
         from rank_bm25 import BM25Okapi
 
-        scores = [float(score) for score in BM25Okapi(documents).get_scores(query_tokens)]
+        scores = [
+            float(score) for score in BM25Okapi(documents).get_scores(query_tokens)
+        ]
     except ImportError:
-        scores = [float(sum(token in set(tokens) for token in query_tokens)) for tokens in documents]
+        scores = [
+            float(sum(token in set(tokens) for token in query_tokens))
+            for tokens in documents
+        ]
 
     query_set = set(query_tokens)
     ranked = []
@@ -108,7 +130,9 @@ def bm25_rerank(
         copied["bm25_score"] = score
         overlap = len(query_set.intersection(documents[index])) / max(1, len(query_set))
         copied["lexical_overlap"] = overlap
-        ranked.append((score, overlap, float(item.get("raw_matches") or 0), index, copied))
+        ranked.append(
+            (score, overlap, float(item.get("raw_matches") or 0), index, copied)
+        )
     ranked.sort(key=lambda entry: (-entry[0], -entry[1], -entry[2], entry[3]))
     return [entry[4] for entry in ranked]
 
@@ -164,8 +188,17 @@ def classify_query_route(text: str) -> str:
     """문서 검색이 필요 없는 짧은 인사·감사 발화를 규칙으로 분류함"""
     normalized = re.sub(r"[\s.!?,~。！？]+", "", text).lower()
     if normalized in {
-        "안녕", "안녕하세요", "안녕하십니까", "반가워요", "반갑습니다",
-        "고마워", "고마워요", "감사합니다", "수고하세요", "너누구야", "너는누구니",
+        "안녕",
+        "안녕하세요",
+        "안녕하십니까",
+        "반가워요",
+        "반갑습니다",
+        "고마워",
+        "고마워요",
+        "감사합니다",
+        "수고하세요",
+        "너누구야",
+        "너는누구니",
     }:
         return "conversation"
     return "retrieval"

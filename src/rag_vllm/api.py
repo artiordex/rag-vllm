@@ -29,28 +29,43 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 
 from .config import ChatClientCredential, get_settings
 from .db import DatabaseError, app_source_lock, check_db, close_db_pool, init_db
 from .embeddings import EmbeddingError
+from .eval.deepeval_adapter import evaluate_with_deepeval
+from .eval.local_evaluator import LocalRagEvaluator
+from .guardrails import GuardrailAction, InputGuardrail, OutputGuardrail
 from .llm import LLMError, close_shared_llm_client
+from .lmops import get_lmops
 from .metrics import record_http_request, render_prometheus_metrics
 from .models import (
     AuditLogItem,
     ChatDeleteRequest,
     ChatHealthResponse,
     ChatIngestQualitySummary,
-    ChatIngestResponse,
     ChatIngestRequest,
-    ChatQueryResponse,
+    ChatIngestResponse,
     ChatQueryRequest,
+    ChatQueryResponse,
     ChatStructuredQueryRequest,
     ChatStructuredQueryResponse,
     ChunkItem,
-    DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
     DraftRequest,
@@ -81,11 +96,6 @@ from .models import (
     TextIngestRequest,
     VectorStoreStatusResponse,
 )
-from .eval.deepeval_adapter import evaluate_with_deepeval
-from .eval.local_evaluator import LocalRagEvaluator
-from .guardrails import GuardrailAction, InputGuardrail, OutputGuardrail
-from .lmops import get_lmops
-from .vector_stores import get_vector_store
 from .moe_dq_client import (
     MAX_MOE_UPLOAD_BYTES,
     MoeDqUpstreamError,
@@ -95,7 +105,6 @@ from .moe_dq_client import (
 )
 from .parsers import MAX_DOCUMENT_INPUT_BYTES, ParseError, parse_document
 from .quality import diagnose_text
-from .standardization import detect_and_mask_pii
 from .service import (
     diagnose_document_quality,
     document_summary,
@@ -114,12 +123,16 @@ from .service import (
     stream_query_rag,
     structured_quality_service,
 )
+from .standardization import detect_and_mask_pii
+from .vector_stores import get_vector_store
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+def _require_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> None:
     """설정된 API 키가 있을 때 요청 헤더를 검증함
 
     Raises:
@@ -135,7 +148,9 @@ def _require_chat_client(
 ) -> ChatClientCredential:
     """앱 전용 토큰만 검증하고 서버 설정의 고정 검색 범위를 반환함"""
     if not settings.chat_clients:
-        raise HTTPException(status_code=503, detail="앱별 RAG 챗봇 연동이 설정되지 않았습니다.")
+        raise HTTPException(
+            status_code=503, detail="앱별 RAG 챗봇 연동이 설정되지 않았습니다."
+        )
     if (
         not x_rag_client_id
         or len(x_rag_client_id) > 64
@@ -144,7 +159,10 @@ def _require_chat_client(
     ):
         raise HTTPException(status_code=401, detail="RAG 앱 인증 헤더가 필요합니다.")
 
-    credential = next((item for item in settings.chat_clients if item.client_id == x_rag_client_id), None)
+    credential = next(
+        (item for item in settings.chat_clients if item.client_id == x_rag_client_id),
+        None,
+    )
     if credential is None:
         raise HTTPException(status_code=401, detail="RAG 앱 인증에 실패했습니다.")
     presented_hash = hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()
@@ -188,8 +206,15 @@ async def lifespan(_app: FastAPI):
         except DatabaseError as exc:
             logger.warning("DB 자동 초기화를 건너뜁니다: %s", exc)
     warmup_task = None
-    if os.getenv("FOOD_SAFETY_CHAT_MODEL_WARMUP", "true").strip().lower() not in {"0", "false", "no", "off"}:
-        warmup_task = asyncio.create_task(_warm_food_safety_model(), name="food-safety-model-warmup")
+    if os.getenv("FOOD_SAFETY_CHAT_MODEL_WARMUP", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        warmup_task = asyncio.create_task(
+            _warm_food_safety_model(), name="food-safety-model-warmup"
+        )
     try:
         yield
     finally:
@@ -223,9 +248,7 @@ app = FastAPI(
 
 # SECURITY: 브라우저 교차 출처 접근은 기본 차단하고 신뢰된 origin만 허용함
 cors_origins = [
-    origin.strip()
-    for origin in settings.cors_origins.split(",")
-    if origin.strip()
+    origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()
 ]
 if cors_origins:
     app.add_middleware(
@@ -243,7 +266,9 @@ async def metrics_middleware(request: Request, call_next: Any) -> Response:
     start_time = time.perf_counter()
     response = await call_next(request)
     duration = time.perf_counter() - start_time
-    record_http_request(request.method, request.url.path, response.status_code, duration)
+    record_http_request(
+        request.method, request.url.path, response.status_code, duration
+    )
     return response
 
 
@@ -256,15 +281,22 @@ chat_router = APIRouter()
 def _chat_source_name(client_id: str, name: str) -> str:
     """앱 이름으로 namespace를 분리하고 출처 이름의 개인정보 후보를 마스킹함"""
     if name != name.strip() or any(ord(character) < 32 for character in name):
-        raise HTTPException(status_code=422, detail="문서 이름은 앞뒤 공백이나 제어 문자를 포함할 수 없습니다.")
+        raise HTTPException(
+            status_code=422,
+            detail="문서 이름은 앞뒤 공백이나 제어 문자를 포함할 수 없습니다.",
+        )
     source_name = f"app://{client_id}/{name}"
     if len(source_name) > 512:
-        raise HTTPException(status_code=422, detail="문서 이름이 허용 길이를 초과했습니다.")
+        raise HTTPException(
+            status_code=422, detail="문서 이름이 허용 길이를 초과했습니다."
+        )
     safe_source_name, _ = detect_and_mask_pii(source_name, mask=True)
     return safe_source_name
 
 
-def _mask_app_chat_response(result: dict[str, Any], project_name: str) -> dict[str, Any]:
+def _mask_app_chat_response(
+    result: dict[str, Any], project_name: str
+) -> dict[str, Any]:
     """앱 응답에 필요한 필드만 남기고 답변·출처를 다시 마스킹·제한함"""
     masked_any = False
     answer = result.get("answer")
@@ -283,12 +315,9 @@ def _mask_app_chat_response(result: dict[str, Any], project_name: str) -> dict[s
                     detail="RAG 검색 근거 응답 형식을 확인할 수 없습니다.",
                 )
             source_metadata = raw_source.get("metadata", {})
-            if (
-                not isinstance(source_metadata, dict)
-                or (
-                    "project_name" in source_metadata
-                    and source_metadata.get("project_name") != project_name
-                )
+            if not isinstance(source_metadata, dict) or (
+                "project_name" in source_metadata
+                and source_metadata.get("project_name") != project_name
             ):
                 # PGVector scopes by the parent document row, so chunk metadata
                 # can omit project_name. When a backend returns it, reject any
@@ -337,17 +366,19 @@ def _mask_app_chat_response(result: dict[str, Any], project_name: str) -> dict[s
             safe_metadata: dict[str, str | None] = {"project_name": project_name}
             if source_content_digest is not None:
                 safe_metadata["document_content_sha256"] = source_content_digest
-            safe_sources.append({
-                "rank": raw_source.get("rank"),
-                "document_id": raw_source.get("document_id"),
-                "source_name": safe_name[:256],
-                "chunk_index": raw_source.get("chunk_index"),
-                # Third-party reranker logits are not probabilities. Expose
-                # a stable bounded transport score while preserving rank.
-                "score": min(1.0, max(0.0, score)),
-                "text": safe_text[:1_200],
-                "metadata": safe_metadata,
-            })
+            safe_sources.append(
+                {
+                    "rank": raw_source.get("rank"),
+                    "document_id": raw_source.get("document_id"),
+                    "source_name": safe_name[:256],
+                    "chunk_index": raw_source.get("chunk_index"),
+                    # Third-party reranker logits are not probabilities. Expose
+                    # a stable bounded transport score while preserving rank.
+                    "score": min(1.0, max(0.0, score)),
+                    "text": safe_text[:1_200],
+                    "metadata": safe_metadata,
+                }
+            )
         result["sources"] = safe_sources
 
     if masked_any and result.get("guardrail_action") in {None, "allow", "mask"}:
@@ -355,7 +386,12 @@ def _mask_app_chat_response(result: dict[str, Any], project_name: str) -> dict[s
         violations = result.get("guardrail_violations")
         if not isinstance(violations, list):
             violations = []
-        violations.append({"category": "pii", "message": "응답의 개인정보 후보를 다시 마스킹했습니다."})
+        violations.append(
+            {
+                "category": "pii",
+                "message": "응답의 개인정보 후보를 다시 마스킹했습니다.",
+            }
+        )
         result["guardrail_violations"] = violations
     # Evaluation objects contain the full query and answer, while `context` repeats
     # complete retrieved chunks. Neither is needed by the app-facing chatbot API.
@@ -376,7 +412,9 @@ def chat_ingest_endpoint(
 ) -> ChatIngestResponse:
     """앱 전용 자격증명으로 승인 파생 텍스트를 고정 앱 코퍼스에 등록함"""
     if "ingest" not in credential.permissions:
-        raise HTTPException(status_code=403, detail="이 RAG 앱에는 문서 색인 권한이 없습니다.")
+        raise HTTPException(
+            status_code=403, detail="이 RAG 앱에는 문서 색인 권한이 없습니다."
+        )
     safe_source_name = _chat_source_name(credential.client_id, request.name)
     try:
         ingest_settings = replace(
@@ -387,7 +425,11 @@ def chat_ingest_endpoint(
         lock_context = (
             nullcontext()
             if settings.vector_store_type == "cpp_engine"
-            else app_source_lock(settings, project_name=credential.project_name, source_name=safe_source_name)
+            else app_source_lock(
+                settings,
+                project_name=credential.project_name,
+                source_name=safe_source_name,
+            )
         )
         with lock_context:
             result = ingest_text(
@@ -417,7 +459,9 @@ def chat_ingest_endpoint(
             )
         except ValidationError as exc:
             logger.error("앱 색인 응답 계약이 유효하지 않습니다.")
-            raise HTTPException(status_code=502, detail="RAG 색인 응답을 확인할 수 없습니다.") from exc
+            raise HTTPException(
+                status_code=502, detail="RAG 색인 응답을 확인할 수 없습니다."
+            ) from exc
     except Exception as exc:
         raise _service_error(exc) from exc
 
@@ -429,13 +473,17 @@ def chat_delete_endpoint(
 ) -> dict[str, bool]:
     """앱별 토큰의 고정 코퍼스 안에서 해당 출처 이름을 제거함"""
     if "delete" not in credential.permissions:
-        raise HTTPException(status_code=403, detail="이 RAG 앱에는 문서 삭제 권한이 없습니다.")
+        raise HTTPException(
+            status_code=403, detail="이 RAG 앱에는 문서 삭제 권한이 없습니다."
+        )
     source_name = _chat_source_name(credential.client_id, request.name)
     try:
         lock_context = (
             nullcontext()
             if settings.vector_store_type == "cpp_engine"
-            else app_source_lock(settings, project_name=credential.project_name, source_name=source_name)
+            else app_source_lock(
+                settings, project_name=credential.project_name, source_name=source_name
+            )
         )
         with lock_context:
             deleted = remove_scoped_document(
@@ -456,13 +504,23 @@ def chat_query_endpoint(
 ) -> ChatQueryResponse:
     """앱 자격 증명에 연결된 RAG 검색 또는 제한된 모델 단독 생성을 수행함"""
     if "query" not in credential.permissions:
-        raise HTTPException(status_code=403, detail="이 RAG 앱에는 질의 권한이 없습니다.")
-    if request.mode == "model":
-        if credential.client_id != "food-safety-rag" or "generate" not in credential.permissions:
-            raise HTTPException(status_code=403, detail="이 앱에는 모델 생성 권한이 없습니다.")
+        raise HTTPException(
+            status_code=403, detail="이 RAG 앱에는 질의 권한이 없습니다."
+        )
+    if request.mode in {"model", "qwen-vllm"}:
+        if (
+            credential.client_id != "food-safety-rag"
+            or "generate" not in credential.permissions
+        ):
+            raise HTTPException(
+                status_code=403, detail="이 앱에는 모델 생성 권한이 없습니다."
+            )
         return _food_safety_model_chat(request.question, request.context)
     if request.context is not None:
-        raise HTTPException(status_code=422, detail="추가 컨텍스트는 식품안전 모델 모드에서만 사용할 수 있습니다.")
+        raise HTTPException(
+            status_code=422,
+            detail="추가 컨텍스트는 식품안전 모델 모드에서만 사용할 수 있습니다.",
+        )
     try:
         # 일반 LMOps 설정이 바뀌어도 앱별 챗봇의 질문·답변 원문은 저장하지 않음.
         chat_settings = replace(
@@ -495,26 +553,34 @@ def chat_query_endpoint(
             return ChatQueryResponse(**result)
         except ValidationError as exc:
             logger.error("앱 질의 응답 계약이 유효하지 않습니다.")
-            raise HTTPException(status_code=502, detail="RAG 질의 응답을 확인할 수 없습니다.") from exc
+            raise HTTPException(
+                status_code=502, detail="RAG 질의 응답을 확인할 수 없습니다."
+            ) from exc
     except Exception as exc:
         raise _service_error(exc) from exc
 
 
-def _food_safety_model_chat(question: str, context: str | None = None) -> ChatQueryResponse:
-    """식품안전 앱에 한해 로컬 Ollama gpt-oss 모델로 일반 대화를 생성함"""
+def _food_safety_model_chat(
+    question: str, context: str | None = None
+) -> ChatQueryResponse:
+    """식품안전 앱에 한해 로컬 Qwen vLLM 모델로 일반 대화를 생성함"""
     input_guardrail = InputGuardrail(
         block_on_injection=True,
         mask_pii=True,
         max_length=5_000,
     ).validate(question)
     if not input_guardrail.passed:
-        raise HTTPException(status_code=422, detail="질문을 안전하게 처리할 수 없습니다.")
+        raise HTTPException(
+            status_code=422, detail="질문을 안전하게 처리할 수 없습니다."
+        )
 
     try:
-        model_api_url, model = _food_safety_model_config()
+        model_api_url, model, api_key = _food_safety_model_config()
     except ValueError as exc:
         logger.error("식품안전 모델 endpoint 설정이 유효하지 않습니다.")
-        raise HTTPException(status_code=503, detail="식품안전 모델 설정을 확인할 수 없습니다.") from exc
+        raise HTTPException(
+            status_code=503, detail="식품안전 모델 설정을 확인할 수 없습니다."
+        ) from exc
 
     system_prompt = (
         "당신은 식품안전나라의 한국어 AI 도우미입니다. 인사, 일반 대화, 용어 설명, 사용법, 아이디어 요청은 "
@@ -525,7 +591,7 @@ def _food_safety_model_chat(question: str, context: str | None = None) -> ChatQu
     )
     if context and context.strip():
         system_prompt += (
-            "\n\n사용자 질문 앞에 [FOOD_SAFETY_SAMPLE_DB_JSON]이라고 표시된 별도 메시지가 있으면 "
+            "\n\n사용자 메시지에 [FOOD_SAFETY_SAMPLE_DB_JSON]으로 표시된 자료 구간이 있으면 "
             "foodsafety.db 읽기 전용 샘플 DB에서 조회한 자료입니다. 데이터셋 이름·ID·항목·샘플 건수를 "
             "질문에 맞춰 답하는 근거로 사용하고, 적절하면 데이터셋 ID와 이름을 밝혀 주세요. 샘플 행은 일부 예시이므로 "
             "전체 또는 실시간 자료처럼 말하지 마세요. sample_table_available이 false이면 카탈로그 항목만 있다는 뜻이며 "
@@ -535,50 +601,67 @@ def _food_safety_model_chat(question: str, context: str | None = None) -> ChatQu
         )
     timeout_seconds = 80.0
     try:
-        configured_timeout = float(os.getenv("FOOD_SAFETY_CHAT_MODEL_TIMEOUT_SECONDS", "80"))
+        configured_timeout = float(
+            os.getenv("FOOD_SAFETY_CHAT_MODEL_TIMEOUT_SECONDS", "80")
+        )
         timeout_seconds = min(max(configured_timeout, 5.0), 80.0)
     except ValueError:
         pass
 
+    user_content = input_guardrail.sanitized_text
+    if context and context.strip():
+        user_content = (
+            f"[FOOD_SAFETY_SAMPLE_DB_JSON]\n{context.strip()}\n\n"
+            f"사용자 질문: {input_guardrail.sanitized_text}"
+        )
+
     try:
         with httpx.Client(timeout=timeout_seconds, trust_env=False) as client:
             response = client.post(
-                f"{model_api_url}/api/chat",
+                f"{model_api_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        *(
-                            [{"role": "user", "content": f"[FOOD_SAFETY_SAMPLE_DB_JSON]\n{context.strip()}"}]
-                            if context and context.strip() else []
-                        ),
-                        {"role": "user", "content": input_guardrail.sanitized_text},
+                        {"role": "user", "content": user_content},
                     ],
-                    "think": "low",
-                    "options": {"temperature": 0.2, "num_predict": 350},
-                    # Keep the model resident only for this food-safety model path;
-                    # do not change Ollama's shared global keep-alive setting.
-                    "keep_alive": -1,
-                    "stream": False,
+                    "temperature": 0.2,
+                    "max_tokens": 350,
+                    "chat_template_kwargs": {"enable_thinking": False},
                 },
             )
             response.raise_for_status()
             data = response.json()
-        content = data.get("message", {}).get("content")
+        content = data.get("choices", [])[0].get("message", {}).get("content")
         if isinstance(content, list):
             content = "\n".join(
-                str(item.get("text", "")) for item in content
+                str(item.get("text", ""))
+                for item in content
                 if isinstance(item, dict) and isinstance(item.get("text"), str)
             )
         if not isinstance(content, str) or not content.strip() or len(content) > 8_000:
             raise ValueError("model response did not match the chat contract")
-    except (httpx.HTTPError, AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
-        logger.warning("식품안전 로컬 모델 호출 실패; 앱에서 RAG fallback을 시도합니다.")
-        raise HTTPException(status_code=503, detail="식품안전 로컬 모델을 사용할 수 없습니다.") from exc
+    except (
+        httpx.HTTPError,
+        AttributeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        logger.warning(
+            "식품안전 로컬 모델 호출 실패; 앱에서 RAG fallback을 시도합니다."
+        )
+        raise HTTPException(
+            status_code=503, detail="식품안전 로컬 모델을 사용할 수 없습니다."
+        ) from exc
 
     output_guardrail = OutputGuardrail(mask_pii=True).validate(content.strip())
     if not output_guardrail.passed or output_guardrail.action == GuardrailAction.BLOCK:
-        raise HTTPException(status_code=422, detail="모델 응답을 안전하게 사용할 수 없습니다.")
+        raise HTTPException(
+            status_code=422, detail="모델 응답을 안전하게 사용할 수 없습니다."
+        )
     return ChatQueryResponse(
         answer=output_guardrail.sanitized_text[:4_000],
         sources=[],
@@ -587,35 +670,70 @@ def _food_safety_model_chat(question: str, context: str | None = None) -> ChatQu
     )
 
 
-def _food_safety_model_config() -> tuple[str, str]:
-    """식품안전 전용 Ollama endpoint만 허용함"""
-    base_url = str(os.getenv("FOOD_SAFETY_CHAT_MODEL_BASE_URL", "http://127.0.0.1:11434/v1")).strip().rstrip("/")
-    model = str(os.getenv("FOOD_SAFETY_CHAT_MODEL", "gpt-oss:20b")).strip()
-    parsed_url = urlsplit(base_url)
+def _food_safety_model_config() -> tuple[str, str, str]:
+    """식품안전 모델 요청을 기존 로컬 Qwen vLLM endpoint로 고정함"""
+    configured_base_url = str(settings.llm_base_url or "").strip().rstrip("/")
+    base_url = (
+        str(os.getenv("FOOD_SAFETY_CHAT_MODEL_BASE_URL") or configured_base_url)
+        .strip()
+        .rstrip("/")
+    )
+    configured_model = str(settings.llm_model or "").strip()
+    model = str(os.getenv("FOOD_SAFETY_CHAT_MODEL") or configured_model).strip()
+    api_key = str(settings.llm_api_key or "").strip()
+    try:
+        parsed_url = urlsplit(base_url)
+        configured_url = urlsplit(configured_base_url)
+        local_host = parsed_url.hostname in {"127.0.0.1", "localhost", "::1"}
+        configured_local_host = configured_url.hostname in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }
+        valid_port = parsed_url.port == configured_url.port
+    except ValueError as exc:
+        raise ValueError("food-safety model URL is invalid") from exc
     if (
-        parsed_url.scheme != "http"
-        or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed_url.port not in {None, 11434}
-        or parsed_url.path not in {"", "/v1"}
-        or parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment
-        or not model or len(model) > 128
+        not configured_base_url
+        or base_url != configured_base_url
+        or model != configured_model
+        or model != "rag-vllm-model"
+        or not api_key
+        or parsed_url.scheme != "http"
+        or not local_host
+        or not configured_local_host
+        or not valid_port
+        or parsed_url.path != "/v1"
+        or parsed_url.username
+        or parsed_url.password
+        or parsed_url.query
+        or parsed_url.fragment
     ):
-        raise ValueError("model endpoint must be the local Ollama API")
-    return f"{parsed_url.scheme}://{parsed_url.netloc}", model
+        raise ValueError(
+            "food-safety model must use the configured local Qwen vLLM endpoint"
+        )
+    return base_url, model, api_key
 
 
 async def _warm_food_safety_model() -> None:
     """서버 시작 시 식품안전 전용 모델만 백그라운드에서 메모리에 올림"""
     try:
-        model_api_url, model = _food_safety_model_config()
+        model_api_url, model, api_key = _food_safety_model_config()
         timeout = httpx.Timeout(connect=5.0, read=600.0, write=5.0, pool=5.0)
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            response = await client.post(
-                f"{model_api_url}/api/generate",
-                json={"model": model, "prompt": "", "keep_alive": -1, "stream": False},
+            response = await client.get(
+                f"{model_api_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
             )
             response.raise_for_status()
-        logger.info("식품안전 전용 모델 예열 완료 (%s)", model)
+            model_ids = {
+                item.get("id")
+                for item in response.json().get("data", [])
+                if isinstance(item, dict)
+            }
+            if model not in model_ids:
+                raise ValueError("configured Qwen vLLM model is not available")
+        logger.info("식품안전 전용 Qwen vLLM 연결 확인 완료 (%s)", model)
     except Exception as exc:
         logger.warning("식품안전 전용 모델 예열을 건너뜁니다 (%s)", type(exc).__name__)
 
@@ -628,7 +746,9 @@ def chat_structured_query_endpoint(
 ) -> ChatStructuredQueryResponse:
     """앱 토큰의 고정 project_name 범위에 있는 표만 DuckDB로 집계함"""
     if "query" not in credential.permissions:
-        raise HTTPException(status_code=403, detail="이 RAG 앱에는 질의 권한이 없습니다.")
+        raise HTTPException(
+            status_code=403, detail="이 RAG 앱에는 질의 권한이 없습니다."
+        )
     try:
         client_ip = http_request.client.host if http_request.client else None
         chat_settings = replace(
@@ -664,15 +784,22 @@ def chat_health_endpoint(
 ) -> ChatHealthResponse:
     """앱별 query 자격증명으로 RAG 저장소 준비 상태를 확인함"""
     if "query" not in credential.permissions:
-        raise HTTPException(status_code=403, detail="이 RAG 앱에는 질의 권한이 없습니다.")
+        raise HTTPException(
+            status_code=403, detail="이 RAG 앱에는 질의 권한이 없습니다."
+        )
     if settings.vector_store_type == "cpp_engine":
         healthy = get_vector_store(settings, "cpp_engine").health_check()
-        return ChatHealthResponse(status="ok" if healthy else "degraded", database="not_required")
+        return ChatHealthResponse(
+            status="ok" if healthy else "degraded", database="not_required"
+        )
     try:
         database_ok = check_db(settings)
     except DatabaseError:
         database_ok = False
-    return ChatHealthResponse(status="ok" if database_ok else "degraded", database="up" if database_ok else "down")
+    return ChatHealthResponse(
+        status="ok" if database_ok else "degraded",
+        database="up" if database_ok else "down",
+    )
 
 
 def dashboard_html() -> HTMLResponse:
@@ -693,7 +820,10 @@ if settings.dashboard_enabled:
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics_endpoint() -> PlainTextResponse:
     """Prometheus 표준 스크랩용 서비스 지표 텍스트를 반환함"""
-    return PlainTextResponse(content=render_prometheus_metrics(settings), media_type="text/plain; version=0.0.4")
+    return PlainTextResponse(
+        content=render_prometheus_metrics(settings),
+        media_type="text/plain; version=0.0.4",
+    )
 
 
 @app.get("/health", dependencies=[Depends(_require_api_key)])
@@ -715,7 +845,11 @@ def health() -> dict[str, Any]:
                 "llm_configured": bool(settings.llm_base_url and settings.llm_model),
             }
         except Exception as exc:
-            return {"status": "degraded", "database": "not_required", "detail": str(exc)}
+            return {
+                "status": "degraded",
+                "database": "not_required",
+                "detail": str(exc),
+            }
     try:
         database_ok = check_db(settings)
     except DatabaseError as exc:
@@ -793,11 +927,16 @@ async def ingest_file_endpoint(
         upload_limit = min(settings.max_upload_bytes, MAX_DOCUMENT_INPUT_BYTES)
         payload = await file.read(upload_limit + 1)
         if len(payload) > upload_limit:
-            raise HTTPException(status_code=413, detail=f"파일은 {upload_limit}바이트 이하만 허용됩니다.")
+            raise HTTPException(
+                status_code=413,
+                detail=f"파일은 {upload_limit}바이트 이하만 허용됩니다.",
+            )
         parsed_metadata = json.loads(metadata)
         if not isinstance(parsed_metadata, dict):
             raise ValueError("metadata는 JSON object여야 합니다.")
-        parsed = parse_document(file.filename or "uploaded-file", payload, file.content_type)
+        parsed = parse_document(
+            file.filename or "uploaded-file", payload, file.content_type
+        )
         # NOTE: 파서가 확인한 파일 사실값이 호출자 입력보다 우선해야 메타데이터 위조를 줄일 수 있음
         merged_metadata = {**parsed_metadata, **parsed.metadata}
         return ingest_text(
@@ -848,7 +987,9 @@ def delete_document_endpoint(document_id: UUID) -> dict[str, Any]:
     try:
         deleted = remove_document(settings, document_id)
         if not deleted:
-            raise HTTPException(status_code=404, detail="삭제할 문서를 찾지 못했습니다.")
+            raise HTTPException(
+                status_code=404, detail="삭제할 문서를 찾지 못했습니다."
+            )
         return {"deleted": True, "document_id": str(document_id)}
     except Exception as exc:
         raise _service_error(exc) from exc
@@ -858,7 +999,9 @@ def delete_document_endpoint(document_id: UUID) -> dict[str, Any]:
 def extract_endpoint(request: ExtractionRequest) -> ExtractionResponse:
     """저장 문서 또는 입력 텍스트에서 구조화 항목을 추출함"""
     if request.document_id is not None and request.text is not None:
-        raise HTTPException(status_code=422, detail="document_id와 text 중 하나만 지정해야 합니다.")
+        raise HTTPException(
+            status_code=422, detail="document_id와 text 중 하나만 지정해야 합니다."
+        )
     try:
         return extract_document_entities(
             settings,
@@ -879,13 +1022,17 @@ def query_endpoint(request: QueryRequest, http_request: Request) -> QueryRespons
     """
     try:
         client_ip = http_request.client.host if http_request.client else None
-        return query_rag(settings, question=request.question, options=request.to_options(client_ip))
+        return query_rag(
+            settings, question=request.question, options=request.to_options(client_ip)
+        )
     except Exception as exc:
         raise _service_error(exc) from exc
 
 
 @router.post("/query/structured", response_model=StructuredQueryResponse)
-def structured_query_endpoint(request: StructuredQueryRequest, http_request: Request) -> StructuredQueryResponse:
+def structured_query_endpoint(
+    request: StructuredQueryRequest, http_request: Request
+) -> StructuredQueryResponse:
     """CSV·레코드 또는 등록된 CSV/XLSX 표 문서를 DuckDB 집계로 분석함"""
     try:
         client_ip = http_request.client.host if http_request.client else None
@@ -907,7 +1054,9 @@ def structured_query_endpoint(request: StructuredQueryRequest, http_request: Req
 
 
 @router.post("/query/stream")
-def query_stream_endpoint(request: QueryRequest, http_request: Request) -> StreamingResponse:
+def query_stream_endpoint(
+    request: QueryRequest, http_request: Request
+) -> StreamingResponse:
     """질의 검색 및 vLLM 추론 토큰을 Server-Sent Events(SSE)로 실시간 스트리밍함
 
     Caveats:
@@ -929,20 +1078,24 @@ def query_stream_endpoint(request: QueryRequest, http_request: Request) -> Strea
                 return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             def incomplete_guardrail_event() -> str:
-                return encode_event({
-                    "type": "guardrail",
-                    "phase": "final",
-                    "action": GuardrailAction.BLOCK.value,
-                    "faithfulness": 0.0,
-                    "risk_score": 1.0,
-                    "risk_level": "high",
-                    "citation_validity": {
-                        "valid": False,
-                        "valid_citations": [],
-                        "invalid_citations": [],
-                    },
-                    "violations": [{"category": "stream_incomplete", "severity": "high"}],
-                })
+                return encode_event(
+                    {
+                        "type": "guardrail",
+                        "phase": "final",
+                        "action": GuardrailAction.BLOCK.value,
+                        "faithfulness": 0.0,
+                        "risk_score": 1.0,
+                        "risk_level": "high",
+                        "citation_validity": {
+                            "valid": False,
+                            "valid_citations": [],
+                            "invalid_citations": [],
+                        },
+                        "violations": [
+                            {"category": "stream_incomplete", "severity": "high"}
+                        ],
+                    }
+                )
 
             try:
                 for event in stream_generator:
@@ -967,7 +1120,9 @@ def query_stream_endpoint(request: QueryRequest, http_request: Request) -> Strea
                     yield event
             except Exception:
                 logger.exception("rag-vllm streaming request failed")
-                yield encode_event({"type": "error", "message": "질의를 처리하지 못했습니다."})
+                yield encode_event(
+                    {"type": "error", "message": "질의를 처리하지 못했습니다."}
+                )
                 if not final_guardrail_sent:
                     yield incomplete_guardrail_event()
                     final_guardrail_sent = True
@@ -994,7 +1149,9 @@ def query_stream_endpoint(request: QueryRequest, http_request: Request) -> Strea
 def quality_diagnose_endpoint(request: QualityDiagnoseRequest) -> QualityReport:
     """인라인 텍스트 또는 저장 문서의 기초 품질 baseline을 계산함"""
     if request.document_id is not None and request.text is not None:
-        raise HTTPException(status_code=422, detail="document_id와 text 중 하나만 지정해야 합니다.")
+        raise HTTPException(
+            status_code=422, detail="document_id와 text 중 하나만 지정해야 합니다."
+        )
     if request.document_id is not None:
         try:
             result = diagnose_document_quality(settings, request.document_id)
@@ -1004,12 +1161,16 @@ def quality_diagnose_endpoint(request: QualityDiagnoseRequest) -> QualityReport:
             raise HTTPException(status_code=404, detail="문서를 찾지 못했습니다.")
         return result
     if request.text is None:
-        raise HTTPException(status_code=422, detail="document_id 또는 text 중 하나는 필요합니다.")
+        raise HTTPException(
+            status_code=422, detail="document_id 또는 text 중 하나는 필요합니다."
+        )
     return diagnose_text(request.text, request.name, request.metadata)
 
 
 @router.post("/quality/moe/unstructured")
-async def moe_unstructured_diagnose_endpoint(file: UploadFile = File(...)) -> dict[str, Any]:
+async def moe_unstructured_diagnose_endpoint(
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
     """업로드를 MOE 비영속 개발 진단 API로 전달하고 로컬 결과와 비교함
 
     Caveats:
@@ -1040,7 +1201,9 @@ async def moe_unstructured_diagnose_endpoint(file: UploadFile = File(...)) -> di
             raise HTTPException(status_code=422, detail="빈 파일은 진단할 수 없습니다.")
 
         safe_filename = f"upload{suffix}"
-        content_type = mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+        content_type = (
+            mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+        )
         payload = bytes(body)
 
         local_comparison: dict[str, Any]
@@ -1104,7 +1267,9 @@ async def moe_unstructured_compare_endpoint(
         for upload in uploads:
             suffix = Path(upload.filename or "").suffix.lower()
             if len(suffix) > 16 or not suffix or not suffix[1:].isalnum():
-                raise HTTPException(status_code=415, detail="지원되는 파일 확장자를 확인해 주세요.")
+                raise HTTPException(
+                    status_code=415, detail="지원되는 파일 확장자를 확인해 주세요."
+                )
             payload = bytearray()
             while chunk := await upload.read(64 * 1024):
                 payload.extend(chunk)
@@ -1114,9 +1279,13 @@ async def moe_unstructured_compare_endpoint(
                         detail=f"각 파일의 크기는 rag-vllm/MOE 연동 한도({upload_limit} bytes) 이하여야 합니다.",
                     )
             if not payload:
-                raise HTTPException(status_code=422, detail="원본과 정제본은 빈 파일일 수 없습니다.")
+                raise HTTPException(
+                    status_code=422, detail="원본과 정제본은 빈 파일일 수 없습니다."
+                )
             extensions.append(suffix)
-            content_types.append(mimetypes.guess_type(f"upload{suffix}")[0] or "application/octet-stream")
+            content_types.append(
+                mimetypes.guess_type(f"upload{suffix}")[0] or "application/octet-stream"
+            )
             contents.append(bytes(payload))
 
         return await compare_unstructured_uploads(
@@ -1165,10 +1334,14 @@ async def moe_c2_term_matches_endpoint(
 
 
 @router.post("/quality/enterprise", response_model=EnterpriseQualityResponse)
-def enterprise_quality_endpoint(request: EnterpriseQualityRequest) -> EnterpriseQualityResponse:
+def enterprise_quality_endpoint(
+    request: EnterpriseQualityRequest,
+) -> EnterpriseQualityResponse:
     """개인정보 후보 마스킹과 로컬 용어 표준화 품질을 계산함"""
     if request.document_id is not None and request.text is not None:
-        raise HTTPException(status_code=422, detail="document_id와 text 중 하나만 지정해야 합니다.")
+        raise HTTPException(
+            status_code=422, detail="document_id와 text 중 하나만 지정해야 합니다."
+        )
     try:
         return enterprise_quality_service(
             settings,
@@ -1182,10 +1355,14 @@ def enterprise_quality_endpoint(request: EnterpriseQualityRequest) -> Enterprise
 
 
 @router.post("/quality/structured", response_model=StructuredQualityResponse)
-def structured_quality_endpoint(request: StructuredQualityRequest) -> StructuredQualityResponse:
+def structured_quality_endpoint(
+    request: StructuredQualityRequest,
+) -> StructuredQualityResponse:
     """CSV 또는 레코드 목록의 구조 품질을 계산함"""
     if request.csv_text is not None and request.records is not None:
-        raise HTTPException(status_code=422, detail="csv_text와 records 중 하나만 지정해야 합니다.")
+        raise HTTPException(
+            status_code=422, detail="csv_text와 records 중 하나만 지정해야 합니다."
+        )
     try:
         return structured_quality_service(
             csv_text=request.csv_text,
@@ -1197,7 +1374,9 @@ def structured_quality_endpoint(request: StructuredQualityRequest) -> Structured
 
 
 @router.get("/audit/logs", response_model=list[AuditLogItem])
-def audit_logs_endpoint(limit: int = Query(default=50, ge=1, le=200)) -> list[AuditLogItem]:
+def audit_logs_endpoint(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[AuditLogItem]:
     """개인정보를 비공개 처리한 최근 감사 로그를 반환함"""
     try:
         return get_recent_audit_logs(settings, limit=limit)
@@ -1226,8 +1405,11 @@ def draft_endpoint(request: DraftRequest) -> DraftResponse:
 # 가드레일, 정량 평가(Eval), LMOps, 다중 벡터 저장소 엔드포인트 정의함
 # =============================================================================
 
+
 @router.post("/guardrails/validate-input", response_model=GuardrailValidateResponse)
-def validate_input_endpoint(request: GuardrailValidateInputRequest) -> GuardrailValidateResponse:
+def validate_input_endpoint(
+    request: GuardrailValidateInputRequest,
+) -> GuardrailValidateResponse:
     """사용자 질의 또는 입력 텍스트의 탈옥·인젝션·개인정보 위반 여부를 검증함"""
     try:
         guard = InputGuardrail(
@@ -1248,7 +1430,9 @@ def validate_input_endpoint(request: GuardrailValidateInputRequest) -> Guardrail
 
 
 @router.post("/guardrails/validate-output", response_model=GuardrailValidateResponse)
-def validate_output_endpoint(request: GuardrailValidateOutputRequest) -> GuardrailValidateResponse:
+def validate_output_endpoint(
+    request: GuardrailValidateOutputRequest,
+) -> GuardrailValidateResponse:
     """생성된 답변의 환각 위험, 개인정보 누출 및 유해성을 검증함"""
     try:
         guard = OutputGuardrail(mask_pii=request.mask_pii)
@@ -1308,7 +1492,11 @@ def eval_rag_endpoint(request: RagEvalRequest) -> RagEvalResponse:
                 context_precision=local_details.context_precision,
                 context_recall=local_details.context_recall,
                 hallucination_risk=(
-                    "low" if faithfulness >= 0.75 else "medium" if faithfulness >= 0.45 else "high"
+                    "low"
+                    if faithfulness >= 0.75
+                    else "medium"
+                    if faithfulness >= 0.45
+                    else "high"
                 ),
                 overall_score=overall,
                 details=deepeval_metrics,
@@ -1377,7 +1565,9 @@ def get_lmops_summary_endpoint() -> LmopsMetricsSummaryResponse:
 
 
 @router.post("/lmops/feedback", response_model=LmopsFeedbackResponse)
-def record_lmops_feedback_endpoint(request: LmopsFeedbackRequest) -> LmopsFeedbackResponse:
+def record_lmops_feedback_endpoint(
+    request: LmopsFeedbackRequest,
+) -> LmopsFeedbackResponse:
     """사용자가 제공한 질의응답 피드백을 기록함"""
     try:
         manager = get_lmops(settings)
@@ -1402,7 +1592,9 @@ def export_lmops_sft_endpoint(
     """긍정 피드백 또는 사용자가 수정한 고품질 질의응답을 SFT 파인튜닝용 데이터셋으로 내보냄"""
     try:
         manager = get_lmops(settings)
-        return manager.export_feedback_to_sft(output_path=output_path, min_rating=min_rating)
+        return manager.export_feedback_to_sft(
+            output_path=output_path, min_rating=min_rating
+        )
     except Exception as exc:
         raise _service_error(exc) from exc
 

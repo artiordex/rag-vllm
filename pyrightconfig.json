@@ -1,0 +1,10 @@
+{
+  "include": [
+    "src"
+  ],
+  "extraPaths": [
+    "src",
+    ".venv/lib/python3.12/site-packages"
+  ],
+  "pythonVersion": "3.12"
+}
